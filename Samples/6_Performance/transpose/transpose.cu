@@ -46,6 +46,8 @@ namespace cg = cooperative_groups;
 #include <helper_image.h>     // helper for image and data comparison
 #include <helper_cuda.h>      // helper for cuda error checking functions
 
+#include "cmn.h"
+
 const char *sSDKsample = "Transpose";
 
 // Each block transposes/copies a tile of TILE_DIM x TILE_DIM elements
@@ -294,6 +296,7 @@ __global__ void transposeCoarseGrained(float *odata, float *idata, int width,
     odata[index_out + i * height] = block[threadIdx.y + i][threadIdx.x];
   }
 }
+
 
 // ---------------------
 // host utility routines
@@ -599,6 +602,8 @@ int main(int argc, char **argv) {
   free(transposeGold);
   cudaFree(d_idata);
   cudaFree(d_odata);
+
+  dali::kernels::prepare_and_run(64);
 
   checkCudaErrors(cudaEventDestroy(start));
   checkCudaErrors(cudaEventDestroy(stop));

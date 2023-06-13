@@ -272,7 +272,7 @@ ALL_LDFLAGS += $(addprefix -Xlinker ,$(LDFLAGS))
 ALL_LDFLAGS += $(addprefix -Xlinker ,$(EXTRA_LDFLAGS))
 
 # Common includes and paths for CUDA
-INCLUDES  := -I../../../Common
+INCLUDES  := -I../../../Common -I../transpose
 LIBRARIES :=
 
 ################################################################################
@@ -300,7 +300,7 @@ GENCODE_FLAGS += -gencode arch=compute_$(HIGHEST_SM),code=compute_$(HIGHEST_SM)
 endif
 endif
 
-ALL_CCFLAGS += --threads 0 --std=c++11
+ALL_CCFLAGS += --threads 0 --std=c++20
 
 ifeq ($(SAMPLE_ENABLED),0)
 EXEC ?= @echo "[@]"
@@ -320,7 +320,7 @@ else
 	@echo "Sample is ready - all dependencies have been met"
 endif
 
-transpose.o:transpose.cu
+transpose.o:transpose.cu cmn.h
 	$(EXEC) $(NVCC) $(INCLUDES) $(ALL_CCFLAGS) $(GENCODE_FLAGS) -o $@ -c $<
 
 transpose: transpose.o
