@@ -121,27 +121,27 @@ __global__ void copy(float *odata, float *idata, int width, int height) {
 //   }
 // }
 
-constexpr int kTileHeight = 2;
+constexpr int kTileHeight = 4;
 
 __global__ void copySharedMem(float *odata, float *idata, int width,
                               int height) {
-  __shared__ float tile[TILE_DIM * kTileHeight];
+  __shared__ float tile[2 * TILE_DIM * kTileHeight];
 
   auto group = cooperative_groups::this_thread_block();
 
   // Create a synchronization object (C++20 barrier)
-  __shared__ cuda::barrier<cuda::thread_scope::thread_scope_block> barrier;
+  __shared__ cuda::barrier<cuda::thread_scope::thread_scope_block> barrier[kTileHeight];
   if (group.thread_rank() == 0) {
-      init(&barrier, group.size());
+      init(&barrier[0], group.size());
+      init(&barrier[1], group.size());
+      init(&barrier[2], group.size());
+      init(&barrier[3], group.size());
   }
   group.sync();
 
-  int xIndex = blockIdx.x * TILE_DIM + threadIdx.x;
-  int yIndex = blockIdx.y * kTileHeight + threadIdx.y;
 
-  int tile_start = blockIdx.y * kTileHeight * width + blockIdx.x * TILE_DIM;
+  int tile_start = blockIdx.y * kTileHeight * width + blockIdx.x * 2 * TILE_DIM;
 
-  int index = xIndex + width * yIndex;
   // printf("Group size: %d \n", cta.size());
 
   // assume that it is divisible, worry later
@@ -149,23 +149,35 @@ __global__ void copySharedMem(float *odata, float *idata, int width,
   //   tile[threadIdx.y * TILE_DIM + threadIdx.x] = idata[index];
   //   // cg::memcpy_async(cta, tile,)
   // }
-  // int copy_width = min(TILE_DIM, width - blockIdx.x * TILE_DIM);
-  constexpr int copy_width = TILE_DIM;
-  for (int y = yIndex, tileY = 0; yIndex < height && tileY < kTileHeight; y++, tileY++) {
-    cuda::memcpy_async(group, tile + tileY * TILE_DIM, &idata[tile_start + tileY * width], sizeof(float) * copy_width, barrier);
-  }
+  int copy_width = min(2 * TILE_DIM, width - blockIdx.x * 2 * TILE_DIM);
+  // constexpr int copy_width = TILE_DIM;
+  // for (int y = yIndex, tileY = 0; yIndex < height && tileY < kTileHeight; y += 2, tileY += 2) {
+  cuda::memcpy_async(group, tile + 0 * 2 * TILE_DIM, &idata[tile_start + 0 * width], sizeof(float) * copy_width, barrier[0]);
+  cuda::memcpy_async(group, tile + 1 * 2 * TILE_DIM, &idata[tile_start + 1 * width], sizeof(float) * copy_width, barrier[1]);
+  cuda::memcpy_async(group, tile + 2 * 2 * TILE_DIM, &idata[tile_start + 2 * width], sizeof(float) * copy_width, barrier[2]);
+  cuda::memcpy_async(group, tile + 3 * 2 *TILE_DIM, &idata[tile_start + 3 * width], sizeof(float) * copy_width, barrier[3]);
+
+
+  // }
   // cg::sync(cta);
   // or:
   // cta.sync();
 
-  barrier.arrive_and_wait(); // Wait for all copies to complete
+  barrier[0].arrive_and_wait(); // Wait for all copies to complete
+  cuda::memcpy_async(group, &idata[tile_start + 0 * width], tile + 0 * 2 * TILE_DIM, sizeof(float) * copy_width, barrier[0]);
+  barrier[1].arrive_and_wait(); // Wait for all copies to complete
+  cuda::memcpy_async(group, &idata[tile_start + 1 * width], tile + 1 * 2 * TILE_DIM, sizeof(float) * copy_width, barrier[1]);
+  barrier[2].arrive_and_wait(); // Wait for all copies to complete
+  cuda::memcpy_async(group, &idata[tile_start + 2 * width], tile + 2 * 2 * TILE_DIM, sizeof(float) * copy_width, barrier[2]);
+  barrier[3].arrive_and_wait(); // Wait for all copies to complete
+  cuda::memcpy_async(group, &idata[tile_start + 3 * width], tile + 3 * 2 *TILE_DIM, sizeof(float) * copy_width, barrier[3]);
 
   // if (xIndex < height && yIndex < width) {
   //   odata[index] = tile[threadIdx.y * TILE_DIM + threadIdx.x];
   // }
-  for (int y = yIndex, tileY = 0; yIndex < height && tileY < kTileHeight; y++, tileY++) {
-    cuda::memcpy_async(group, &idata[tile_start + tileY * width], tile + tileY * TILE_DIM, sizeof(float) * copy_width, barrier);
-  }
+  // for (int y = yIndex, tileY = 0; yIndex < height && tileY < kTileHeight; y++, tileY++) {
+  //   cuda::memcpy_async(group, &idata[tile_start + tileY * width], tile + tileY * TILE_DIM, sizeof(float) * copy_width, barrier);
+  // }
 }
 
 // -------------------------------------------------------
@@ -583,7 +595,7 @@ int main(int argc, char **argv) {
 
     // execution configuration parameters
     if (k == 1) {
-      grid = dim3(size_x / TILE_DIM, size_y / kTileHeight),
+      grid = dim3(size_x / (2 * TILE_DIM), size_y / kTileHeight),
       threads = dim3(TILE_DIM, kTileHeight);
     } else {
       grid = dim3(size_x / TILE_DIM, size_y / TILE_DIM),
