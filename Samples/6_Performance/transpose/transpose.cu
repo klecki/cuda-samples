@@ -39,6 +39,7 @@
 // -----------------------------------------------------------------------------
 
 #include <cooperative_groups.h>
+#include <cuda/barrier>
 
 namespace cg = cooperative_groups;
 // Utilities and system includes
@@ -55,7 +56,7 @@ const char *sSDKsample = "Transpose";
 // TILE_DIM/BLOCK_ROWS elements.  TILE_DIM must be an integral multiple of
 // BLOCK_ROWS
 
-#define TILE_DIM 16
+#define TILE_DIM 32
 #define BLOCK_ROWS 16
 
 // This sample assumes that MATRIX_SIZE_X = MATRIX_SIZE_Y
@@ -92,29 +93,78 @@ __global__ void copy(float *odata, float *idata, int width, int height) {
   }
 }
 
+
+// TODO the loop over TILE_DIM doesn't make sense here
+// __global__ void copySharedMem(float *odata, float *idata, int width,
+//                               int height) {
+//   // Handle to thread block group
+//   cg::thread_block cta = cg::this_thread_block();
+//   __shared__ float tile[TILE_DIM][TILE_DIM];
+
+//   int xIndex = blockIdx.x * TILE_DIM + threadIdx.x;
+//   int yIndex = blockIdx.y * TILE_DIM + threadIdx.y;
+
+//   int index = xIndex + width * yIndex;
+
+//   for (int i = 0; i < TILE_DIM; i += BLOCK_ROWS) {
+//     if (xIndex < width && yIndex < height) {
+//       tile[threadIdx.y][threadIdx.x] = idata[index];
+//     }
+//   }
+
+//   cg::sync(cta);
+
+//   for (int i = 0; i < TILE_DIM; i += BLOCK_ROWS) {
+//     if (xIndex < height && yIndex < width) {
+//       odata[index] = tile[threadIdx.y][threadIdx.x];
+//     }
+//   }
+// }
+
+constexpr int kTileHeight = 2;
+
 __global__ void copySharedMem(float *odata, float *idata, int width,
                               int height) {
-  // Handle to thread block group
-  cg::thread_block cta = cg::this_thread_block();
-  __shared__ float tile[TILE_DIM][TILE_DIM];
+  __shared__ float tile[TILE_DIM * kTileHeight];
+
+  auto group = cooperative_groups::this_thread_block();
+
+  // Create a synchronization object (C++20 barrier)
+  __shared__ cuda::barrier<cuda::thread_scope::thread_scope_block> barrier;
+  if (group.thread_rank() == 0) {
+      init(&barrier, group.size());
+  }
+  group.sync();
 
   int xIndex = blockIdx.x * TILE_DIM + threadIdx.x;
-  int yIndex = blockIdx.y * TILE_DIM + threadIdx.y;
+  int yIndex = blockIdx.y * kTileHeight + threadIdx.y;
+
+  int tile_start = blockIdx.y * kTileHeight * width + blockIdx.x * TILE_DIM;
 
   int index = xIndex + width * yIndex;
+  // printf("Group size: %d \n", cta.size());
 
-  for (int i = 0; i < TILE_DIM; i += BLOCK_ROWS) {
-    if (xIndex < width && yIndex < height) {
-      tile[threadIdx.y][threadIdx.x] = idata[index];
-    }
+  // assume that it is divisible, worry later
+  // if (xIndex < width && yIndex < height) {
+  //   tile[threadIdx.y * TILE_DIM + threadIdx.x] = idata[index];
+  //   // cg::memcpy_async(cta, tile,)
+  // }
+  // int copy_width = min(TILE_DIM, width - blockIdx.x * TILE_DIM);
+  constexpr int copy_width = TILE_DIM;
+  for (int y = yIndex, tileY = 0; yIndex < height && tileY < kTileHeight; y++, tileY++) {
+    cuda::memcpy_async(group, tile + tileY * TILE_DIM, &idata[tile_start + tileY * width], sizeof(float) * copy_width, barrier);
   }
+  // cg::sync(cta);
+  // or:
+  // cta.sync();
 
-  cg::sync(cta);
+  barrier.arrive_and_wait(); // Wait for all copies to complete
 
-  for (int i = 0; i < TILE_DIM; i += BLOCK_ROWS) {
-    if (xIndex < height && yIndex < width) {
-      odata[index] = tile[threadIdx.y][threadIdx.x];
-    }
+  // if (xIndex < height && yIndex < width) {
+  //   odata[index] = tile[threadIdx.y * TILE_DIM + threadIdx.x];
+  // }
+  for (int y = yIndex, tileY = 0; yIndex < height && tileY < kTileHeight; y++, tileY++) {
+    cuda::memcpy_async(group, &idata[tile_start + tileY * width], tile + tileY * TILE_DIM, sizeof(float) * copy_width, barrier);
   }
 }
 
@@ -430,16 +480,6 @@ int main(int argc, char **argv) {
   void (*kernel)(float *, float *, int, int);
   const char *kernelName;
 
-  // execution configuration parameters
-  dim3 grid(size_x / TILE_DIM, size_y / TILE_DIM),
-      threads(TILE_DIM, BLOCK_ROWS);
-
-  if (grid.x < 1 || grid.y < 1) {
-    printf("[%s] grid size computation incorrect in test \nExiting...\n\n",
-           sSDKsample);
-    exit(EXIT_FAILURE);
-  }
-
   // CUDA events
   cudaEvent_t start, stop;
 
@@ -534,6 +574,26 @@ int main(int argc, char **argv) {
         kernel = &transposeDiagonal;
         kernelName = "diagonal          ";
         break;
+    }
+
+
+    dim3 grid;
+
+    dim3 threads;
+
+    // execution configuration parameters
+    if (k == 1) {
+      grid = dim3(size_x / TILE_DIM, size_y / kTileHeight),
+      threads = dim3(TILE_DIM, kTileHeight);
+    } else {
+      grid = dim3(size_x / TILE_DIM, size_y / TILE_DIM),
+      threads = dim3(TILE_DIM, BLOCK_ROWS);
+    }
+
+    if (grid.x < 1 || grid.y < 1) {
+      printf("[%s] grid size computation incorrect in test \nExiting...\n\n",
+            sSDKsample);
+      exit(EXIT_FAILURE);
     }
 
     // set reference solution
