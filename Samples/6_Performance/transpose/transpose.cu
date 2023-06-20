@@ -560,7 +560,7 @@ int main(int argc, char **argv) {
 
   bool success = true;
 
-  for (int k = 1; k < 2; k++) {
+  for (int k = 0; k < 8; k++) {
     // set kernel pointer
     switch (k) {
       case 0:
