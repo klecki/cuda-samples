@@ -148,8 +148,9 @@ __global__ void copySharedMem(float *odata, float *idata, int width,
 
 
 
-  int yIndex = blockIdx.y * TILE_DIM;
-  int tile_start = blockIdx.y * kTileHeight * width + blockIdx.x * kWidthMul * TILE_DIM;
+  int yIndex = blockIdx.y * kTileHeight;
+  int xIndex = blockIdx.x * kWidthMul * TILE_DIM;
+  int tile_start = yIndex * width + xIndex;
 
   // printf("Group size: %d \n", cta.size());
 
@@ -158,7 +159,7 @@ __global__ void copySharedMem(float *odata, float *idata, int width,
   //   tile[threadIdx.y * TILE_DIM + threadIdx.x] = idata[index];
   //   // cg::memcpy_async(cta, tile,)
   // }
-  int copy_width = min(kWidthMul * TILE_DIM, width - blockIdx.x * kWidthMul * TILE_DIM);
+  int copy_width = min(kWidthMul * TILE_DIM, width - xIndex);
   // constexpr int copy_width = TILE_DIM;
   for (int y = yIndex, tileY = 0; yIndex < height && tileY < kTileHeight; y++, tileY++) {
     cuda::memcpy_async(group, tile + tileY * kWidthMul * TILE_DIM, &idata[tile_start + tileY * width], sizeof(float) * copy_width, barrier);
@@ -190,8 +191,9 @@ __global__ void copySharedMem(float *odata, float *idata, int width,
   // }
   barrier.arrive_and_wait(); // Wait for all copies to complete
   for (int y = yIndex, tileY = 0; yIndex < height && tileY < kTileHeight; y++, tileY++) {
-    cuda::memcpy_async(group, &idata[tile_start + tileY * width], tile + tileY * kWidthMul* TILE_DIM, sizeof(float) * copy_width, barrier);
+    cuda::memcpy_async(group, &odata[tile_start + tileY * width], tile + tileY * kWidthMul* TILE_DIM, sizeof(float) * copy_width, barrier);
   }
+  // barrier.arrive_and_wait(); // Wait for all copies to complete
 }
 
 // -------------------------------------------------------
@@ -558,7 +560,7 @@ int main(int argc, char **argv) {
 
   bool success = true;
 
-  for (int k = 0; k < 8; k++) {
+  for (int k = 1; k < 2; k++) {
     // set kernel pointer
     switch (k) {
       case 0:
@@ -641,6 +643,7 @@ int main(int argc, char **argv) {
 
     // take measurements for loop over kernel launches
     checkCudaErrors(cudaEventRecord(start, 0));
+    cudaMemset(d_odata, 0, mem_size);
 
     for (int i = 0; i < NUM_REPS; i++) {
       kernel<<<grid, threads>>>(d_odata, d_idata, size_x, size_y);
