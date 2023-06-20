@@ -122,7 +122,7 @@ __global__ void copy(float *odata, float *idata, int width, int height) {
 // }
 
 constexpr int kTileHeight = 4;
-constexpr int kWidthMul = 4;
+constexpr int kWidthMul = 2;
 
 
 __global__ void copySharedMem(float *odata, float *idata, int width,
