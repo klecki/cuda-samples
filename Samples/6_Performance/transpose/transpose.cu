@@ -167,19 +167,19 @@ __global__ void copySharedMem(float *odata, float *idata, int width,
 
   // cuda::memcpy_async(group, tile + 0 * kWidthMul * TILE_DIM, &idata[tile_start + 0 * width], sizeof(float) * copy_width, barrier[0]);
   // barrier[0].arrive_and_wait();
-  // cuda::memcpy_async(group, &idata[tile_start + 0 * width], tile + 0 * kWidthMul* TILE_DIM, sizeof(float) * copy_width, barrier[0]);
+  // cuda::memcpy_async(group, &odata[tile_start + 0 * width], tile + 0 * kWidthMul* TILE_DIM, sizeof(float) * copy_width, barrier[0]);
 
   // cuda::memcpy_async(group, tile + 1 * kWidthMul * TILE_DIM, &idata[tile_start + 1 * width], sizeof(float) * copy_width, barrier[1]);
   // barrier[1].arrive_and_wait();
-  // cuda::memcpy_async(group, &idata[tile_start + 1 * width], tile + 1 * kWidthMul* TILE_DIM, sizeof(float) * copy_width, barrier[1]);
+  // cuda::memcpy_async(group, &odata[tile_start + 1 * width], tile + 1 * kWidthMul* TILE_DIM, sizeof(float) * copy_width, barrier[1]);
 
   // cuda::memcpy_async(group, tile + 2 * kWidthMul * TILE_DIM, &idata[tile_start + 2 * width], sizeof(float) * copy_width, barrier[2]);
   // barrier[2].arrive_and_wait();
-  // cuda::memcpy_async(group, &idata[tile_start + 2 * width], tile + 2 * kWidthMul* TILE_DIM, sizeof(float) * copy_width, barrier[2]);
+  // cuda::memcpy_async(group, &odata[tile_start + 2 * width], tile + 2 * kWidthMul* TILE_DIM, sizeof(float) * copy_width, barrier[2]);
 
   // cuda::memcpy_async(group, tile + 3 * kWidthMul * TILE_DIM, &idata[tile_start + 3 * width], sizeof(float) * copy_width, barrier[3]);
   // barrier[3].arrive_and_wait();
-  // cuda::memcpy_async(group, &idata[tile_start + 3 * width], tile + 3 * kWidthMul* TILE_DIM, sizeof(float) * copy_width, barrier[3]);
+  // cuda::memcpy_async(group, &odata[tile_start + 3 * width], tile + 3 * kWidthMul* TILE_DIM, sizeof(float) * copy_width, barrier[3]);
 
   // cg::sync(cta);
   // or:
