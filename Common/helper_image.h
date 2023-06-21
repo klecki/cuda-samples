@@ -514,8 +514,8 @@ inline bool sdkWriteFile(const char *filename, const T *data, unsigned int len,
 //! @param len        number of elements in reference and data
 //! @param epsilon    epsilon to use for the comparison
 //////////////////////////////////////////////////////////////////////////////
-template <class T, class S>
-inline bool compareData(const T *reference, const T *data,
+template <class T, class S, class U=T>
+inline bool compareData(const T *reference, const U *data,
                         const unsigned int len, const S epsilon,
                         const float threshold) {
   assert(epsilon >= 0);

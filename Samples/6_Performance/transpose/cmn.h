@@ -170,12 +170,49 @@ void prepare_and_run(int num_samples) {
   cudaMalloc((void **)&norm_add_gpu, num_samples * sizeof(float) * C);
   cudaMalloc((void **)&norm_mul_gpu, num_samples * sizeof(float) * C);
 
+  std::vector<float> norm_add(num_samples * C, 0.f), norm_mul(num_samples * C, 1.f);
+  cudaMemcpy(norm_add_gpu, norm_add.data(), num_samples * sizeof(float) * C, cudaMemcpyHostToDevice);
+  cudaMemcpy(norm_mul_gpu, norm_mul.data(), num_samples * sizeof(float) * C, cudaMemcpyHostToDevice);
+
+
   // prepare input 0, 1, 2, 3, 4...
   // prepare gold output 0,3,6.... 1,4,7,... 2,5,8,...
+  std::vector<input_t> input_cpu;
+  input_cpu.resize(H * W * C);
+  for (int i = 0; i < H * W * C; i++) {
+    input_cpu[i] = i;
+  }
+
+  std::vector<input_t> gold_cpu;
+  gold_cpu.resize(H * W * C);
+  for (int c = 0; c < C; c++) {
+    for (int i = 0; i < H * W; i++) {
+      gold_cpu[c * H*W + i] = c + i * C;
+    }
+  }
+
+  cudaMemcpy(input_gpu, input_cpu.data(), sizeof(input_t) * H * W * C, cudaMemcpyHostToDevice);
+  for (int i = 1; i < num_samples; i++) {
+    cudaMemcpy(input_gpu + i * H * W * C, input_gpu, sizeof(input_t) * H * W * C, cudaMemcpyDeviceToDevice);
+  }
+
+
+  std::vector<output_t> output_cpu;
+  output_cpu.resize(num_samples * H * W * C);
+
 
   cudaStream_t stream;
   cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking);
   RunSN(num_samples, input_gpu, output_gpu, norm_add_gpu, norm_mul_gpu, stream);
+
+  cudaMemcpy(output_cpu.data(), output_gpu, sizeof(output_t) * num_samples *  H * W * C, cudaMemcpyDeviceToHost);
+  for (int i = 0; i < num_samples; i++) {
+    bool res = compareData(gold_cpu.data(), output_cpu.data() + i * H * W * C, H * W * C, 0.01f, 0.0f);
+    if (res == false) {
+      printf("*** %s kernel FAILED ***\n", "CMN");
+    }
+  }
+
   cudaFree(input_gpu);
   cudaFree(output_gpu);
   cudaFree(norm_add_gpu);
