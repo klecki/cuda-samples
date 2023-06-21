@@ -55,6 +55,9 @@ __global__ void SliceNormalizeKernel_2D_NoPad(const SampleDesc<Out, In, 2> *samp
 
 static constexpr int H = 1000, W = 1000, C = 3, NUM_ITERS = 100;
 
+using input_t = uint8_t;
+using output_t = float;
+
 void RunSN(int num_samples, uint8_t *input, float *output, float *norm_add, float *norm_mul, cudaStream_t stream) {
   constexpr int spatial_ndim = 2;
   constexpr int channel_dim = 2;
@@ -159,13 +162,17 @@ void RunSN(int num_samples, uint8_t *input, float *output, float *norm_add, floa
 }
 
 void prepare_and_run(int num_samples) {
-  uint8_t *input_gpu;
-  float *output_gpu;
+  input_t *input_gpu;
+  output_t *output_gpu;
   float *norm_add_gpu, *norm_mul_gpu;
-  cudaMalloc((void **)&input_gpu, num_samples * sizeof(uint8_t) * H * W * C);
-  cudaMalloc((void **)&output_gpu, num_samples * sizeof(float) * H * W * C);
+  cudaMalloc((void **)&input_gpu, num_samples * sizeof(input_t) * H * W * C);
+  cudaMalloc((void **)&output_gpu, num_samples * sizeof(output_t) * H * W * C);
   cudaMalloc((void **)&norm_add_gpu, num_samples * sizeof(float) * C);
   cudaMalloc((void **)&norm_mul_gpu, num_samples * sizeof(float) * C);
+
+  // prepare input 0, 1, 2, 3, 4...
+  // prepare gold output 0,3,6.... 1,4,7,... 2,5,8,...
+
   cudaStream_t stream;
   cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking);
   RunSN(num_samples, input_gpu, output_gpu, norm_add_gpu, norm_mul_gpu, stream);
