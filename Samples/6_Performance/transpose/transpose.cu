@@ -76,7 +76,7 @@ int MAX_TILES = (FLOOR(MATRIX_SIZE_X, 512) * FLOOR(MATRIX_SIZE_Y, 512)) /
 // performed: 1) over kernel launches and 2) inside the kernel over just the
 // loads and stores
 
-#define NUM_REPS 100
+#define NUM_REPS 1
 
 // -------------------------------------------------------
 // Copies

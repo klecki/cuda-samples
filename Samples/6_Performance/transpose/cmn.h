@@ -53,16 +53,16 @@ __global__ void SliceNormalizeKernel_2D_NoPad(const SampleDesc<Out, In, 2> *samp
   SliceNormalizeKernel_2D_NoPad_Ch<static_channels>(sample, tile);
 }
 
-static constexpr int H = 1000, W = 1000, C = 3, NUM_ITERS = 100;
+static constexpr int H = 1000, W = 1000, C = 3, NUM_ITERS = 1;
 
-using input_t = uint8_t;
+using input_t = float;
 using output_t = float;
 
-void RunSN(int num_samples, uint8_t *input, float *output, float *norm_add, float *norm_mul, cudaStream_t stream) {
+void RunSN(int num_samples, input_t *input, output_t *output, float *norm_add, float *norm_mul, cudaStream_t stream) {
   constexpr int spatial_ndim = 2;
   constexpr int channel_dim = 2;
-  using Out = float;
-  using In = uint8_t;
+  using Out = output_t;
+  using In = input_t;
   using Tile = kernels::BlockDesc<spatial_ndim>;
   using Sample = SampleDesc<Out, In, spatial_ndim>;
 
@@ -145,7 +145,7 @@ void RunSN(int num_samples, uint8_t *input, float *output, float *norm_add, floa
   checkCudaErrors(cudaEventElapsedTime(&kernelTime, start, stop));
 
       // report effective bandwidths
-  float kernelBandwidth = num_samples * 1000.0f * (H * W * C * (sizeof(uint8_t) + sizeof(float))) / (1024 * 1024 * 1024) /
+  float kernelBandwidth = num_samples * 1000.0f * (H * W * C * (sizeof(input_t) + sizeof(output_t))) / (1024 * 1024 * 1024) /
     (kernelTime / NUM_ITERS);
   printf(
   "transpose %s, Throughput = %.4f GB/s, Time = %.5f ms, Size = %u fp32 "
