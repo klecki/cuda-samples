@@ -7,11 +7,13 @@
 #include "dali/kernels/common/block_setup.h"
 #include "dali/core/fast_div.h"
 
+// #include "dbg.h"
+
 namespace dali {
 
 namespace kernels {
 
-static constexpr int kBlockSizeMul = 3;
+static constexpr int kBlockSizeMul = 24;
 static constexpr int kBlockWidth = 32;
 static constexpr int kStaticChannels = 3;
 
@@ -35,8 +37,9 @@ template <typename Out, typename In>
 struct SimpleSampleDesc {
   Out *__restrict__ out;
   const In *__restrict__ in;
-  // int h, w, c;
-  TensorShape<3> shape;
+  int H, W, C;
+  // didn't work
+  //  TensorShape<3> shape;
 
   const float *__restrict__ norm_add;
   const float *__restrict__ norm_mul;
@@ -72,17 +75,17 @@ __global__ void SortChannels(const SimpleSampleDesc<Out, In> *samples,
   const auto &block = blocks[blockIdx.x];
   const auto &sample = samples[block.sample_idx];
   // SliceNormalizeKernel_2D_NoPad_Ch<static_channels>(sample, tile);
-  int y_stride = sample.shape[1] * sample.shape[2];  // TODO: make channels always 3?
+  int y_stride = sample.W * sample.C;  // TODO: make channels always 3?
   for (int64_t idx = threadIdx.x + block.start.x; idx < block.end.x; idx += blockDim.x) {
     // todo fast_div
     int y = idx / y_stride;
     int y_rem = idx - y * y_stride;
-    int x = y_rem / sample.shape[2];
-    int c = y_rem - x * sample.shape[2];
-    if (y < sample.shape[0] && x < sample.shape[1]) {
+    int x = y_rem / sample.C;
+    int c = y_rem - x * sample.C;
+    if (y < sample.H && x < sample.W) {
       float fpin = sample.in[idx];
       float fpout = fmaf(fpin, sample.norm_mul[c], sample.norm_add[c]);
-      sample.out[c * sample.shape[0] * sample.shape[1] + y * sample.shape[1] + x] = fpout;
+      sample.out[c * sample.H * sample.W + y * sample.W + x] = fpout;
     }
   }
 }
@@ -117,29 +120,39 @@ __global__ void SortChannelsSharedIn(const SimpleSampleDesc<Out, In> *samples,
   const auto &sample = samples[block.sample_idx];
   __shared__ In tile[kStaticChannels][(kBlockSizeMul / kStaticChannels) * kBlockWidth];
   // SliceNormalizeKernel_2D_NoPad_Ch<static_channels>(sample, tile);
-  int y_stride = sample.shape[1] * sample.shape[2];  // TODO: make channels always 3?
+  int y_stride = sample.W * sample.C;  // TODO: make channels always 3?
+  // if (threadIdx.x == 0){
+  //   printf("Block: %ld - %ld\n", block.start.x, block.end.x);
+
+  // }
   for (int64_t idx = threadIdx.x + block.start.x, base_x = threadIdx.x; idx < block.end.x; idx += blockDim.x, base_x += blockDim.x) {
     // todo fast_div
-    int y = idx / y_stride;
-    int y_rem = idx - y * y_stride;
-    int x = y_rem / sample.shape[2];
-    int c = y_rem - x * sample.shape[2];
-    if (y < sample.shape[0] && x < sample.shape[1]) {
-      tile[c][base_x] = sample.in[idx];
-    }
+    // int y = idx / y_stride;
+    // int y_rem = idx - y * y_stride;
+    // int x = y_rem / sample.C;
+    // int c = y_rem - x * sample.C;
+    int c = idx % sample.C;
+    // if (blockIdx.x == 1)
+    //   printf("Reading idx: %ld: (y, x, c) / (H, W, C): _, _, %d / %d, %d, %d with base_x: %d\n",
+    //           idx, c, sample.H, sample.W, sample.C, base_x);
+    // if (y < sample.H && x < sample.W) {
+    tile[c][base_x / sample.C] = sample.in[idx];
+    // }
   }
   __syncthreads();
-  for (int64_t idx = threadIdx.x; idx < kBlockWidth * (kBlockSizeMul / kStaticChannels); idx += blockDim.x) {
+
+  // idx is not divided by the static channels (mostly the block.start.x)
+  for (int64_t idx = threadIdx.x + block.start.x / kStaticChannels, base_x = threadIdx.x; idx < block.end.x / kStaticChannels; idx += blockDim.x, base_x += blockDim.x) {
     // todo fast_div
-    int y = idx / sample.shape[1];
-    int x = idx - y * sample.shape[1];
+    int y = idx / sample.W;
+    int x = idx - y * sample.W;
     #pragma unroll kStaticChannels
     for (int c = 0; c < kStaticChannels; c++) {
-      if (y < sample.shape[0] && x < sample.shape[1]) {
-        float fpin = tile[c][x];
+      // if (y < sample.H && x < sample.W) {
+        float fpin = tile[c][base_x];
         float fpout = fmaf(fpin, sample.norm_mul[c], sample.norm_add[c]);
-        sample.out[c * sample.shape[0] * sample.shape[1] + y * sample.shape[1] + x] = fpout;
-      }
+        sample.out[c * sample.H * sample.W + y * sample.W + x] = fpout;
+      // }
     }
   }
 }
@@ -217,11 +230,11 @@ static constexpr int H = 1000, W = 1000, C = 3, NUM_ITERS = 100;
 using input_t = uint8_t;
 using output_t = float;
 
-void RunSN(int num_samples, uint8_t *input, float *output, float *norm_add, float *norm_mul, cudaStream_t stream) {
+void RunSN(int num_samples, input_t *input, output_t *output, float *norm_add, float *norm_mul, cudaStream_t stream) {
   constexpr int spatial_ndim = 2;
   constexpr int channel_dim = 2;
-  using Out = float;
-  using In = uint8_t;
+  using Out = output_t;
+  using In = input_t;
   using Tile = kernels::BlockDesc<spatial_ndim>;
   using Sample = SampleDesc<Out, In, spatial_ndim>;
   using CollapsedBlock = kernels::BlockDesc<1>;
@@ -262,10 +275,11 @@ void RunSN(int num_samples, uint8_t *input, float *output, float *norm_add, floa
   for (int i = 0; i < num_samples; i++) {
     simple_sample_desc[i].in = input + i * img_size;
     simple_sample_desc[i].out = output + i * img_size;
-    // simple_sample_desc.h = H;
-    // simple_sample_desc.w = W;
-    // simple_sample_desc.c = C;
-    simple_sample_desc[i].shape = {H, W, C};
+    simple_sample_desc[i].H = H;
+    simple_sample_desc[i].W = W;
+    simple_sample_desc[i].C = C;
+    // doesn't work, I thought it would, but it does not
+    // simple_sample_desc[i].shape = {H, W, C};
     simple_sample_desc[i].norm_add = norm_add + i * C;
     simple_sample_desc[i].norm_mul = norm_mul + i * C;
 
@@ -273,15 +287,22 @@ void RunSN(int num_samples, uint8_t *input, float *output, float *norm_add, floa
 
 
 
-  BlockSetup<1, -1> collapsed_block_setup;
+  BlockSetup<1, -1> collapsed_block_setup(1); // why do I need to set this multiplier here? xDDDD
   collapsed_block_setup.SetDefaultBlockSize({kBlockSizeMul * kBlockWidth});
+  collapsed_block_setup.SetBlockDim(dim3{128, 1, 1});
   collapsed_block_setup.SetupBlocks(collapsed_shape, true);
   auto collapsed_blocks_cpu = collapsed_block_setup.Blocks();
   auto collapsed_grid_dim = collapsed_block_setup.GridDim();
   auto collapsed_block_dim = collapsed_block_setup.BlockDim();
 
-  std::cout << "(" << collapsed_grid_dim.x << ", " << collapsed_grid_dim.y << ", " << collapsed_grid_dim.z << ") "
-            << "(" << collapsed_block_dim.x << ", " << collapsed_block_dim.y << ", " << collapsed_block_dim.z << ") " << std::endl;
+  // std::cout << kBlockSizeMul * kBlockWidth << std::endl;
+
+  // for (auto &block : collapsed_blocks_cpu) {
+  //   std::cout << block.start << " " << block.end << std::endl;
+  // }
+
+  // std::cout << "(" << collapsed_grid_dim.x << ", " << collapsed_grid_dim.y << ", " << collapsed_grid_dim.z << ") "
+  //           << "(" << collapsed_block_dim.x << ", " << collapsed_block_dim.y << ", " << collapsed_block_dim.z << ") " << std::endl;
 
   BlockSetup<spatial_ndim, channel_dim> block_setup;
   block_setup.SetDefaultBlockSize({64, 64});
@@ -319,8 +340,11 @@ void RunSN(int num_samples, uint8_t *input, float *output, float *norm_add, floa
   //   <<<grid_dim, block_dim, 0, stream>>>(samples_gpu, tiles_gpu);
 
   // SortChannels<Out, In><<<collapsed_grid_dim, collapsed_block_dim, 0, stream>>>(simple_samples_gpu, collapsed_blocks_gpu);
-  SortChannelsFastDiv<Out, In><<<collapsed_grid_dim, collapsed_block_dim, 0, stream>>>(simple_samples_gpu, collapsed_blocks_gpu);
-  // SortChannelsSharedIn<Out, In><<<collapsed_grid_dim, collapsed_block_dim, 0, stream>>>(simple_samples_gpu, collapsed_blocks_gpu);
+  // SortChannelsFastDiv<Out, In><<<collapsed_grid_dim, collapsed_block_dim, 0, stream>>>(simple_samples_gpu, collapsed_blocks_gpu);
+  printf("Running kernel: (%d %d %d) x (%d %d %d)\n",
+        collapsed_grid_dim.x, collapsed_grid_dim.y, collapsed_grid_dim.z,
+        collapsed_block_dim.x, collapsed_block_dim.y, collapsed_block_dim.z);
+  SortChannelsSharedIn<Out, In><<<collapsed_grid_dim, collapsed_block_dim, 0, stream>>>(simple_samples_gpu, collapsed_blocks_gpu);
 
   // CUDA events
   cudaEvent_t start, stop;
@@ -336,8 +360,8 @@ void RunSN(int num_samples, uint8_t *input, float *output, float *norm_add, floa
 
     // SortChannels<Out, In><<<collapsed_grid_dim, collapsed_block_dim, 0, stream>>>(simple_samples_gpu, collapsed_blocks_gpu);
 
-    SortChannelsFastDiv<Out, In><<<collapsed_grid_dim, collapsed_block_dim, 0, stream>>>(simple_samples_gpu, collapsed_blocks_gpu);
-    // SortChannelsSharedIn<Out, In><<<collapsed_grid_dim, collapsed_block_dim, 0, stream>>>(simple_samples_gpu, collapsed_blocks_gpu);
+    // SortChannelsFastDiv<Out, In><<<collapsed_grid_dim, collapsed_block_dim, 0, stream>>>(simple_samples_gpu, collapsed_blocks_gpu);
+    SortChannelsSharedIn<Out, In><<<collapsed_grid_dim, collapsed_block_dim, 0, stream>>>(simple_samples_gpu, collapsed_blocks_gpu);
   }
 
 
@@ -361,6 +385,19 @@ void RunSN(int num_samples, uint8_t *input, float *output, float *norm_add, floa
   cudaFree(samples_gpu);
   cudaFree(tiles_gpu);
 
+}
+
+template <typename T>
+void print_planes(T *data) {
+  for (int c = 0; c < C; c++) {
+    printf("\n\nPlane: %d: =============\n", c);
+    for (int y = 0; y < H; y++) {
+      for (int x = 0; x < W; x++) {
+        printf("%d, ", static_cast<int32>(data[c * H * W + y * W + x]));
+      }
+      printf("|||\n");
+    }
+  }
 }
 
 void prepare_and_run(int num_samples) {
@@ -410,6 +447,10 @@ void prepare_and_run(int num_samples) {
   cudaMemcpy(output_cpu.data(), output_gpu, sizeof(output_t) * num_samples *  H * W * C, cudaMemcpyDeviceToHost);
   for (int i = 0; i < num_samples; i++) {
     bool res = compareData(gold_cpu.data(), output_cpu.data() + i * H * W * C, H * W * C, 0.01f, 0.0f);
+    // printf("Expected:\n");
+    // print_planes(gold_cpu.data());
+    // printf("\n\n=============================================================\nComputed:\n");
+    // print_planes(output_cpu.data() + i * H * W * C);
     if (res == false) {
       printf("*** %s kernel FAILED ***\n", "CMN");
     }
@@ -425,6 +466,7 @@ void prepare_and_run(int num_samples) {
 
 }
 }
+
 
 
 #endif  // CMN_H
