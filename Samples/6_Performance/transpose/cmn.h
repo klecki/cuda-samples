@@ -144,14 +144,14 @@ __global__ void SortChannelsSharedIn(const SimpleSampleDesc<Out, In> *samples,
   // idx is not divided by the static channels (mostly the block.start.x)
   for (int64_t idx = threadIdx.x + block.start.x / kStaticChannels, base_x = threadIdx.x; idx < block.end.x / kStaticChannels; idx += blockDim.x, base_x += blockDim.x) {
     // todo fast_div
-    int y = idx / sample.W;
-    int x = idx - y * sample.W;
+    // int y = idx / sample.W;
+    // int x = idx - y * sample.W;
     #pragma unroll kStaticChannels
     for (int c = 0; c < kStaticChannels; c++) {
       // if (y < sample.H && x < sample.W) {
         float fpin = tile[c][base_x];
         float fpout = fmaf(fpin, sample.norm_mul[c], sample.norm_add[c]);
-        sample.out[c * sample.H * sample.W + y * sample.W + x] = fpout;
+        sample.out[c * sample.H * sample.W + idx] = fpout;
       // }
     }
   }
