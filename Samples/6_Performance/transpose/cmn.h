@@ -166,6 +166,36 @@ __global__ void SortChannelsSharedPreload(const SimpleSampleDesc<Out, In> *sampl
   }
 }
 
+template <typename Out, typename In>
+__global__ void SortChannelsSharedPreloadFloat(const SimpleSampleDesc<Out, In> *samples,
+                             const BlockDesc<1> *blocks) {
+  const auto &block = blocks[blockIdx.x];
+  const auto &sample = samples[block.sample_idx];
+  __shared__ In tile[kBlockSizeMul * kBlockWidth];
+  int y_stride = sample.W * sample.C;  // TODO: make channels always 3?
+  uint32_t *tmp = reinterpret_cast<uint32_t*>(tile);
+  const uint32_t *in = reinterpret_cast<const uint32_t*>(sample.in);
+  for (int64_t idx = threadIdx.x + block.start.x / 4, base_x = threadIdx.x; idx < block.end.x / 4; idx += blockDim.x, base_x += blockDim.x) {
+    // todo fast_div
+    // int c = idx % sample.C;
+    // tile[base_x] = sample.in[idx];
+    tmp[base_x] = in[idx];
+  }
+  __syncthreads();
+
+  // idx is not divided by the static channels (mostly the block.start.x)
+  for (int64_t idx = threadIdx.x + block.start.x / kStaticChannels, base_x = threadIdx.x;
+    idx < block.end.x / kStaticChannels; idx += blockDim.x, base_x += blockDim.x) {
+    #pragma unroll kStaticChannels
+    for (int c = 0; c < kStaticChannels; c++) {
+      float fpin = tile[base_x * sample.C + c];
+      float fpout = fmaf(fpin, sample.norm_mul[c], sample.norm_add[c]);
+      sample.out[c * sample.H * sample.W + idx] = fpout;
+    }
+  }
+}
+
+
 
 // Worse
 template <typename Out, typename In>
@@ -265,7 +295,7 @@ __global__ void SliceNormalizeKernel_2D_NoPad(const SampleDesc<Out, In, 2> *samp
   SliceNormalizeKernel_2D_NoPad_Ch<static_channels>(sample, tile);
 }
 
-static constexpr int H = 1000, W = 1000, C = 3, NUM_ITERS = 100;
+static constexpr int H = 1024, W = 1024, C = 3, NUM_ITERS = 100;
 
 using input_t = uint8_t;
 using output_t = float;
@@ -397,6 +427,9 @@ void RunSN(int num_samples, input_t *input, output_t *output, float *norm_add, f
     SortChannelsInPlace1<Out, In><<<collapsed_grid_dim, collapsed_block_dim, 0, stream>>>(simple_samples_gpu, collapsed_blocks_gpu);
   if (id == 5)
     SortChannelsSharedPreload<Out, In><<<collapsed_grid_dim, collapsed_block_dim, 0, stream>>>(simple_samples_gpu, collapsed_blocks_gpu);
+  if (id == 6)
+    SortChannelsSharedPreloadFloat<Out, In><<<collapsed_grid_dim, collapsed_block_dim, 0, stream>>>(simple_samples_gpu, collapsed_blocks_gpu);
+
 
   // CUDA events
   cudaEvent_t start, stop;
@@ -424,6 +457,8 @@ void RunSN(int num_samples, input_t *input, output_t *output, float *norm_add, f
       SortChannelsInPlace1<Out, In><<<collapsed_grid_dim, collapsed_block_dim, 0, stream>>>(simple_samples_gpu, collapsed_blocks_gpu);
     if (id == 5)
       SortChannelsSharedPreload<Out, In><<<collapsed_grid_dim, collapsed_block_dim, 0, stream>>>(simple_samples_gpu, collapsed_blocks_gpu);
+    if (id == 6)
+      SortChannelsSharedPreloadFloat<Out, In><<<collapsed_grid_dim, collapsed_block_dim, 0, stream>>>(simple_samples_gpu, collapsed_blocks_gpu);
   }
 
 
@@ -504,7 +539,7 @@ void prepare_and_run(int num_samples) {
 
   cudaStream_t stream;
   cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking);
-  for (int id = 0; id < 6; id++) {
+  for (int id = 0; id < 7; id++) {
     RunSN(num_samples, input_gpu, output_gpu, norm_add_gpu, norm_mul_gpu, stream, id);
 
     cudaMemcpy(output_cpu.data(), output_gpu, sizeof(output_t) * num_samples *  H * W * C, cudaMemcpyDeviceToHost);
