@@ -14,7 +14,7 @@ namespace dali {
 namespace kernels {
 
 static constexpr int kBlockSizeMul = 24;
-static constexpr int kBlockWidth = 32;
+static constexpr int kBlockWidth = 128;
 static constexpr int kStaticChannels = 3;
 
 template <typename Out, typename In, int spatial_ndim>
@@ -119,102 +119,142 @@ __global__ void SortChannelsSharedIn(const SimpleSampleDesc<Out, In> *samples,
   const auto &block = blocks[blockIdx.x];
   const auto &sample = samples[block.sample_idx];
   __shared__ In tile[kStaticChannels][(kBlockSizeMul / kStaticChannels) * kBlockWidth];
-  // SliceNormalizeKernel_2D_NoPad_Ch<static_channels>(sample, tile);
   int y_stride = sample.W * sample.C;  // TODO: make channels always 3?
-  // if (threadIdx.x == 0){
-  //   printf("Block: %ld - %ld\n", block.start.x, block.end.x);
-
-  // }
   for (int64_t idx = threadIdx.x + block.start.x, base_x = threadIdx.x; idx < block.end.x; idx += blockDim.x, base_x += blockDim.x) {
     // todo fast_div
-    // int y = idx / y_stride;
-    // int y_rem = idx - y * y_stride;
-    // int x = y_rem / sample.C;
-    // int c = y_rem - x * sample.C;
     int c = idx % sample.C;
-    // if (blockIdx.x == 1)
-    //   printf("Reading idx: %ld: (y, x, c) / (H, W, C): _, _, %d / %d, %d, %d with base_x: %d\n",
-    //           idx, c, sample.H, sample.W, sample.C, base_x);
-    // if (y < sample.H && x < sample.W) {
     tile[c][base_x / sample.C] = sample.in[idx];
-    // }
   }
   __syncthreads();
 
   // idx is not divided by the static channels (mostly the block.start.x)
-  for (int64_t idx = threadIdx.x + block.start.x / kStaticChannels, base_x = threadIdx.x; idx < block.end.x / kStaticChannels; idx += blockDim.x, base_x += blockDim.x) {
-    // todo fast_div
-    // int y = idx / sample.W;
-    // int x = idx - y * sample.W;
+  for (int64_t idx = threadIdx.x + block.start.x / kStaticChannels, base_x = threadIdx.x;
+    idx < block.end.x / kStaticChannels; idx += blockDim.x, base_x += blockDim.x) {
     #pragma unroll kStaticChannels
     for (int c = 0; c < kStaticChannels; c++) {
-      // if (y < sample.H && x < sample.W) {
-        float fpin = tile[c][base_x];
-        float fpout = fmaf(fpin, sample.norm_mul[c], sample.norm_add[c]);
-        sample.out[c * sample.H * sample.W + idx] = fpout;
-      // }
+      float fpin = tile[c][base_x];
+      float fpout = fmaf(fpin, sample.norm_mul[c], sample.norm_add[c]);
+      sample.out[c * sample.H * sample.W + idx] = fpout;
     }
   }
 }
 
-// template <typename Out, typename In>
-// __global__ void SortChannelsSharedOut(const SimpleSampleDesc<Out, In> *samples,
-//                              const BlockDesc<1> *blocks) {
-//   const auto &block = blocks[blockIdx.x];
-//   const auto &sample = samples[block.sample_idx];
-//   __shared__ In tile[kStaticChannels][(kBlockSizeMul / kStaticChannels) * kBlockWidth];
-//   int y_stride = sample.shape[1] * sample.shape[2];  // TODO: make channels always 3?
-//   // int y_start = block.start.x / y_stride;
-//   // int x_start = (block.start.x - y_start * y_stride) / sample.shape[2];
-//   for (int64_t idx = threadIdx.x + block.start.x, base_x = threadIdx.x; idx < block.end.x; idx += blockDim.x, base_x += blockDim.x) {
-//     // todo fast_div
-//     int y = idx / y_stride;
-//     int y_rem = idx - y * y_stride;
-//     int x = y_rem / sample.shape[2];
-//     int c = y_rem - x * sample.shape[2];
-//     if (y < sample.shape[0] && x < sample.shape[1]) {
-//       tile[c][base_x] = sample.in[idx];
-//     }
-//   }
-//   __syncthreads();
-//   for (int64_t idx = threadIdx.x; idx < kBlockWidth * (kBlockSizeMul / kStaticChannels); idx += blockDim.x) {
-//     // todo fast_div
-//     int y = idx / sample.shape[1];
-//     int x = idx - y * sample.shape[1];
-//     #pragma unroll kStaticChannels
-//     for (int c = 0; c < kStaticChannels; c++) {
-//       if (y < sample.shape[0] && x < sample.shape[1]) {
-//         float fpin = tile[c][x];
-//         float fpout = fmaf(fpin, sample.norm_mul[c], sample.norm_add[c]);
-//         sample.out[c * sample.shape[0] * sample.shape[1] + y * sample.shape[1] + x] = fpout;
-//       }
-//     }
-//   }
-// }
+
+template <typename Out, typename In>
+__global__ void SortChannelsSharedPreload(const SimpleSampleDesc<Out, In> *samples,
+                             const BlockDesc<1> *blocks) {
+  const auto &block = blocks[blockIdx.x];
+  const auto &sample = samples[block.sample_idx];
+  __shared__ In tile[kBlockSizeMul * kBlockWidth];
+  int y_stride = sample.W * sample.C;  // TODO: make channels always 3?
+  for (int64_t idx = threadIdx.x + block.start.x, base_x = threadIdx.x; idx < block.end.x; idx += blockDim.x, base_x += blockDim.x) {
+    // todo fast_div
+    // int c = idx % sample.C;
+    tile[base_x] = sample.in[idx];
+  }
+  __syncthreads();
+
+  // idx is not divided by the static channels (mostly the block.start.x)
+  for (int64_t idx = threadIdx.x + block.start.x / kStaticChannels, base_x = threadIdx.x;
+    idx < block.end.x / kStaticChannels; idx += blockDim.x, base_x += blockDim.x) {
+    #pragma unroll kStaticChannels
+    for (int c = 0; c < kStaticChannels; c++) {
+      float fpin = tile[base_x * sample.C + c];
+      float fpout = fmaf(fpin, sample.norm_mul[c], sample.norm_add[c]);
+      sample.out[c * sample.H * sample.W + idx] = fpout;
+    }
+  }
+}
+
+
+// Worse
+template <typename Out, typename In>
+__global__ void SortChannelsSharedOut(const SimpleSampleDesc<Out, In> *samples,
+                             const BlockDesc<1> *blocks) {
+  const auto &block = blocks[blockIdx.x];
+  const auto &sample = samples[block.sample_idx];
+  __shared__ Out tile[kStaticChannels][(kBlockSizeMul / kStaticChannels) * kBlockWidth];
+  int y_stride = sample.W * sample.C;  // TODO: make channels always 3?
+  for (int64_t idx = threadIdx.x + block.start.x, base_x = threadIdx.x; idx < block.end.x; idx += blockDim.x, base_x += blockDim.x) {
+    // todo fast_div
+    int c = idx % sample.C;
+    tile[c][base_x / sample.C] = sample.in[idx];
+  }
+  __syncthreads();
+
+  // idx is not divided by the static channels (mostly the block.start.x)
+  for (int64_t idx = threadIdx.x + block.start.x / kStaticChannels, base_x = threadIdx.x;
+       idx < block.end.x / kStaticChannels; idx += blockDim.x, base_x += blockDim.x) {
+
+    #pragma unroll kStaticChannels
+    for (int c = 0; c < kStaticChannels; c++) {
+      float fpin = tile[c][base_x];
+      float fpout = fmaf(fpin, sample.norm_mul[c], sample.norm_add[c]);
+      sample.out[c * sample.H * sample.W + idx] = fpout;
+    }
+  }
+}
+
+// Similar perf to the original
+template <typename Out, typename In>
+__global__ void SortChannelsInPlace0(const SimpleSampleDesc<Out, In> *samples,
+                             const BlockDesc<1> *blocks) {
+  const auto &block = blocks[blockIdx.x];
+  const auto &sample = samples[block.sample_idx];
+  // __shared__ Out tile[kStaticChannels][(kBlockSizeMul / kStaticChannels) * kBlockWidth];
+  // int y_stride = sample.W * sample.C;  // TODO: make channels always 3?
+  // for (int64_t idx = threadIdx.x + block.start.x, base_x = threadIdx.x; idx < block.end.x; idx += blockDim.x, base_x += blockDim.x) {
+  //   // todo fast_div
+  //   tile[c][base_x / sample.C] = sample.in[idx];
+  // }
+  // __syncthreads();
+
+  // idx is not divided by the static channels (mostly the block.start.x)
+  for (int64_t idx = threadIdx.x + block.start.x / kStaticChannels, base_x = threadIdx.x;
+       idx < block.end.x / kStaticChannels; idx += blockDim.x, base_x += blockDim.x) {
+    #pragma unroll kStaticChannels
+    for (int c = 0; c < kStaticChannels; c++) {
+      float fpin = sample.in[idx * sample.C + c];
+      float fpout = fmaf(fpin, sample.norm_mul[c], sample.norm_add[c]);
+      sample.out[c * sample.H * sample.W + idx] = fpout;
+    }
+  }
+}
+
+template <typename Out, typename In>
+__global__ void SortChannelsInPlace1(const SimpleSampleDesc<Out, In> *samples,
+                             const BlockDesc<1> *blocks) {
+  const auto &block = blocks[blockIdx.x];
+  const auto &sample = samples[block.sample_idx];
+  // __shared__ Out tile[kStaticChannels][(kBlockSizeMul / kStaticChannels) * kBlockWidth];
+  // int y_stride = sample.W * sample.C;  // TODO: make channels always 3?
+  // for (int64_t idx = threadIdx.x + block.start.x, base_x = threadIdx.x; idx < block.end.x; idx += blockDim.x, base_x += blockDim.x) {
+  //   // todo fast_div
+  //   tile[c][base_x / sample.C] = sample.in[idx];
+  // }
+  // __syncthreads();
+
+  float fpin[kStaticChannels];
+  // idx is not divided by the static channels (mostly the block.start.x)
+  for (int64_t idx = threadIdx.x + block.start.x / kStaticChannels, base_x = threadIdx.x;
+       idx < block.end.x / kStaticChannels; idx += blockDim.x, base_x += blockDim.x) {
 
 
 
-// template <typename Out, typename In>
-// __global__ void SortChannelsSharedOut(const SimpleSampleDesc<Out, In> *samples,
-//                              const BlockDesc<1> *blocks) {
-//   const auto &block = blocks[blockIdx.x];
-//   const auto &sample = samples[block.sample_idx];
-//   __shared__ Out tile[3][32];
-//   // SliceNormalizeKernel_2D_NoPad_Ch<static_channels>(sample, tile);
-//   int y_stride = sample.shape[1] * sample.shape[2];  // TODO: make channels always 3?
-//   for (int64_t idx = threadIdx.x + block.start.x; idx < block.end.x; idx += blockDim.x) {
-//     // todo fast_div
-//     int y = idx / y_stride;
-//     int y_rem = idx - y * y_stride;
-//     int x = y_rem / sample.shape[2];
-//     int c = y_rem - x * sample.shape[2];
-//     if (y < sample.shape[0] && x < sample.shape[1]) {
-//       float fpin = sample.in[idx];
-//       float fpout = fmaf(fpin, sample.norm_mul[c], sample.norm_add[c]);
-//       sample.out[c * sample.shape[0] * sample.shape[1] + y * sample.shape[1] + x] = fpout;
-//     }
-//   }
-// }
+    #pragma unroll kStaticChannels
+    for (int c = 0; c < kStaticChannels; c++) {
+      fpin[c] = sample.in[idx * sample.C + c];
+    }
+    #pragma unroll kStaticChannels
+    for (int c = 0; c < kStaticChannels; c++) {
+      // float fpin = sample.in[idx * sample.C + c];
+      float fpout = fmaf(fpin[c], sample.norm_mul[c], sample.norm_add[c]);
+      sample.out[c * sample.H * sample.W + idx] = fpout;
+    }
+  }
+}
+
+
 
 template <typename Out, typename In>
 __global__ void SliceNormalizeKernel_2D_NoPad(const SampleDesc<Out, In, 2> *samples,
@@ -230,7 +270,7 @@ static constexpr int H = 1000, W = 1000, C = 3, NUM_ITERS = 100;
 using input_t = uint8_t;
 using output_t = float;
 
-void RunSN(int num_samples, input_t *input, output_t *output, float *norm_add, float *norm_mul, cudaStream_t stream) {
+void RunSN(int num_samples, input_t *input, output_t *output, float *norm_add, float *norm_mul, cudaStream_t stream, int id) {
   constexpr int spatial_ndim = 2;
   constexpr int channel_dim = 2;
   using Out = output_t;
@@ -336,15 +376,27 @@ void RunSN(int num_samples, input_t *input, output_t *output, float *norm_add, f
   cudaMemcpy(simple_samples_gpu, simple_sample_desc.data(), num_samples * sizeof(SimpleSample), cudaMemcpyHostToDevice);
   cudaMemcpy(collapsed_blocks_gpu, collapsed_blocks_cpu.data(), collapsed_blocks_cpu.size() * sizeof(CollapsedBlock), cudaMemcpyHostToDevice);
 
-  // SliceNormalizeKernel_2D_NoPad<Out, In>
-  //   <<<grid_dim, block_dim, 0, stream>>>(samples_gpu, tiles_gpu);
+  // printf("Running kernel: (%d %d %d) x (%d %d %d)\n",
+  //       collapsed_grid_dim.x, collapsed_grid_dim.y, collapsed_grid_dim.z,
+  //       collapsed_block_dim.x, collapsed_block_dim.y, collapsed_block_dim.z);
 
-  // SortChannels<Out, In><<<collapsed_grid_dim, collapsed_block_dim, 0, stream>>>(simple_samples_gpu, collapsed_blocks_gpu);
-  // SortChannelsFastDiv<Out, In><<<collapsed_grid_dim, collapsed_block_dim, 0, stream>>>(simple_samples_gpu, collapsed_blocks_gpu);
-  printf("Running kernel: (%d %d %d) x (%d %d %d)\n",
-        collapsed_grid_dim.x, collapsed_grid_dim.y, collapsed_grid_dim.z,
-        collapsed_block_dim.x, collapsed_block_dim.y, collapsed_block_dim.z);
-  SortChannelsSharedIn<Out, In><<<collapsed_grid_dim, collapsed_block_dim, 0, stream>>>(simple_samples_gpu, collapsed_blocks_gpu);
+  if (id == 0)
+    SliceNormalizeKernel_2D_NoPad<Out, In>
+          <<<grid_dim, block_dim, 0, stream>>>(samples_gpu, tiles_gpu);
+  // if (id == 1)
+  //   SortChannels<Out, In><<<collapsed_grid_dim, collapsed_block_dim, 0, stream>>>(simple_samples_gpu, collapsed_blocks_gpu);
+  // if (id == 2)
+  //   // SortChannelsFastDiv<Out, In><<<collapsed_grid_dim, collapsed_block_dim, 0, stream>>>(simple_samples_gpu, collapsed_blocks_gpu);
+  if (id == 1)
+    SortChannelsSharedIn<Out, In><<<collapsed_grid_dim, collapsed_block_dim, 0, stream>>>(simple_samples_gpu, collapsed_blocks_gpu);
+  if (id == 2)
+    SortChannelsSharedOut<Out, In><<<collapsed_grid_dim, collapsed_block_dim, 0, stream>>>(simple_samples_gpu, collapsed_blocks_gpu);
+  if (id == 3)
+    SortChannelsInPlace0<Out, In><<<collapsed_grid_dim, collapsed_block_dim, 0, stream>>>(simple_samples_gpu, collapsed_blocks_gpu);
+  if (id == 4)
+    SortChannelsInPlace1<Out, In><<<collapsed_grid_dim, collapsed_block_dim, 0, stream>>>(simple_samples_gpu, collapsed_blocks_gpu);
+  if (id == 5)
+    SortChannelsSharedPreload<Out, In><<<collapsed_grid_dim, collapsed_block_dim, 0, stream>>>(simple_samples_gpu, collapsed_blocks_gpu);
 
   // CUDA events
   cudaEvent_t start, stop;
@@ -355,13 +407,23 @@ void RunSN(int num_samples, input_t *input, output_t *output, float *norm_add, f
   cudaEventRecord(start, stream);
 
   for (int i = 0; i < NUM_ITERS; i++) {
-    // SliceNormalizeKernel_2D_NoPad<Out, In>
-    //   <<<grid_dim, block_dim, 0, stream>>>(samples_gpu, tiles_gpu);
-
-    // SortChannels<Out, In><<<collapsed_grid_dim, collapsed_block_dim, 0, stream>>>(simple_samples_gpu, collapsed_blocks_gpu);
-
-    // SortChannelsFastDiv<Out, In><<<collapsed_grid_dim, collapsed_block_dim, 0, stream>>>(simple_samples_gpu, collapsed_blocks_gpu);
-    SortChannelsSharedIn<Out, In><<<collapsed_grid_dim, collapsed_block_dim, 0, stream>>>(simple_samples_gpu, collapsed_blocks_gpu);
+    if (id == 0)
+      SliceNormalizeKernel_2D_NoPad<Out, In>
+            <<<grid_dim, block_dim, 0, stream>>>(samples_gpu, tiles_gpu);
+    // if (id == 1)
+    //   SortChannels<Out, In><<<collapsed_grid_dim, collapsed_block_dim, 0, stream>>>(simple_samples_gpu, collapsed_blocks_gpu);
+    // if (id == 2)
+    //   // SortChannelsFastDiv<Out, In><<<collapsed_grid_dim, collapsed_block_dim, 0, stream>>>(simple_samples_gpu, collapsed_blocks_gpu);
+    if (id == 1)
+      SortChannelsSharedIn<Out, In><<<collapsed_grid_dim, collapsed_block_dim, 0, stream>>>(simple_samples_gpu, collapsed_blocks_gpu);
+    if (id == 2)
+      SortChannelsSharedOut<Out, In><<<collapsed_grid_dim, collapsed_block_dim, 0, stream>>>(simple_samples_gpu, collapsed_blocks_gpu);
+    if (id == 3)
+      SortChannelsInPlace0<Out, In><<<collapsed_grid_dim, collapsed_block_dim, 0, stream>>>(simple_samples_gpu, collapsed_blocks_gpu);
+    if (id == 4)
+      SortChannelsInPlace1<Out, In><<<collapsed_grid_dim, collapsed_block_dim, 0, stream>>>(simple_samples_gpu, collapsed_blocks_gpu);
+    if (id == 5)
+      SortChannelsSharedPreload<Out, In><<<collapsed_grid_dim, collapsed_block_dim, 0, stream>>>(simple_samples_gpu, collapsed_blocks_gpu);
   }
 
 
@@ -374,9 +436,9 @@ void RunSN(int num_samples, input_t *input, output_t *output, float *norm_add, f
   float kernelBandwidth = num_samples * 1000.0f * (H * W * C * (sizeof(uint8_t) + sizeof(float))) / (1024 * 1024 * 1024) /
     (kernelTime / NUM_ITERS);
   printf(
-  "transpose %s, Throughput = %.4f GB/s, Time = %.5f ms, Size = %u fp32 "
+  "CMN %d, Throughput = %.4f GB/s, Time = %.5f ms, Size = %u fp32 "
   "elements, NumDevsUsed = %u, Workgroup = %u\n",
-  "CMN", kernelBandwidth, kernelTime / NUM_ITERS, (64 * 64),
+  id, kernelBandwidth, kernelTime / NUM_ITERS, (64 * 64),
   1, 32 * 32);
 
 
@@ -442,17 +504,19 @@ void prepare_and_run(int num_samples) {
 
   cudaStream_t stream;
   cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking);
-  RunSN(num_samples, input_gpu, output_gpu, norm_add_gpu, norm_mul_gpu, stream);
+  for (int id = 0; id < 6; id++) {
+    RunSN(num_samples, input_gpu, output_gpu, norm_add_gpu, norm_mul_gpu, stream, id);
 
-  cudaMemcpy(output_cpu.data(), output_gpu, sizeof(output_t) * num_samples *  H * W * C, cudaMemcpyDeviceToHost);
-  for (int i = 0; i < num_samples; i++) {
-    bool res = compareData(gold_cpu.data(), output_cpu.data() + i * H * W * C, H * W * C, 0.01f, 0.0f);
-    // printf("Expected:\n");
-    // print_planes(gold_cpu.data());
-    // printf("\n\n=============================================================\nComputed:\n");
-    // print_planes(output_cpu.data() + i * H * W * C);
-    if (res == false) {
-      printf("*** %s kernel FAILED ***\n", "CMN");
+    cudaMemcpy(output_cpu.data(), output_gpu, sizeof(output_t) * num_samples *  H * W * C, cudaMemcpyDeviceToHost);
+    for (int i = 0; i < num_samples; i++) {
+      bool res = compareData(gold_cpu.data(), output_cpu.data() + i * H * W * C, H * W * C, 0.01f, 0.0f);
+      // printf("Expected:\n");
+      // print_planes(gold_cpu.data());
+      // printf("\n\n=============================================================\nComputed:\n");
+      // print_planes(output_cpu.data() + i * H * W * C);
+      if (res == false) {
+        printf("*** %s kernel FAILED ***\n", "CMN");
+      }
     }
   }
 
