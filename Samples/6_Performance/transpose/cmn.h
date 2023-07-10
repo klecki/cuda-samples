@@ -362,7 +362,6 @@ void RunSN(int num_samples, input_t *input, output_t *output, float *norm_add, f
   vec<spatial_ndim, int64_t> out_stride = {1, W}; // HMMM, WTH
   int out_ch_stride = H * W;
 
-
   // Roi<2> bounds = {ivec{0, 0}, out_size};
 
   TensorListShape<3> shape = uniform_list_shape(num_samples, TensorShape<3>{H, W, C});
@@ -403,6 +402,31 @@ void RunSN(int num_samples, input_t *input, output_t *output, float *norm_add, f
   auto collapsed_grid_dim = collapsed_block_setup.GridDim();
   auto collapsed_block_dim = collapsed_block_setup.BlockDim();
 
+
+  std::vector<BlockDesc<1>> collapsed_blocks_aligned_manual;
+  constexpr int kTileSize = kBlockSizeMul * kBlockWidth;
+  for (int sample_idx = 0; sample_idx < collapsed_shape.num_samples(); sample_idx++) {
+    int64_t len = collapsed_shape.tensor_shape(sample_idx)[0];
+    auto sample_base = reinterpret_cast<uintptr_t>(simple_sample_desc[sample_idx].in);
+    auto aligned_start = align_up(sample_base, kTileSize);
+    auto first_tile_size = aligned_start - sample_base;
+    BlockDesc<1> blk;
+    blk.sample_idx = sample_idx;
+    blk.start[0] = 0;
+    if (first_tile_size) {
+      blk.end[0] = first_tile_size;
+      collapsed_blocks_aligned_manual.push_back(blk);
+    }
+    for (int64_t start = first_tile_size; start < len; start += kTileSize) {
+      blk.start[0] = start;
+      blk.end[0] = std::min(start + kTileSize, len);
+      collapsed_blocks_aligned_manual.push_back(blk);
+    }
+  }
+
+
+
+
   // std::cout << kBlockSizeMul * kBlockWidth << std::endl;
 
   // for (auto &block : collapsed_blocks_cpu) {
@@ -440,9 +464,21 @@ void RunSN(int num_samples, input_t *input, output_t *output, float *norm_add, f
 
 
   cudaMalloc((void **)&simple_samples_gpu, num_samples * sizeof(SimpleSample));
-  cudaMalloc((void **)&collapsed_blocks_gpu, collapsed_blocks_cpu.size() * sizeof(CollapsedBlock));
   cudaMemcpy(simple_samples_gpu, simple_sample_desc.data(), num_samples * sizeof(SimpleSample), cudaMemcpyHostToDevice);
-  cudaMemcpy(collapsed_blocks_gpu, collapsed_blocks_cpu.data(), collapsed_blocks_cpu.size() * sizeof(CollapsedBlock), cudaMemcpyHostToDevice);
+
+  constexpr bool USE_ALIGNMENT = true;
+  if (USE_ALIGNMENT) {
+    cudaMalloc((void **)&collapsed_blocks_gpu, collapsed_blocks_aligned_manual.size() * sizeof(CollapsedBlock));
+    cudaMemcpy(collapsed_blocks_gpu, collapsed_blocks_aligned_manual.data(), collapsed_blocks_aligned_manual.size() * sizeof(CollapsedBlock), cudaMemcpyHostToDevice);
+
+    // TODO DODODODODO: VERY IMPORTANT, ALIGN THE GRID:
+    collapsed_grid_dim = dim3(collapsed_blocks_aligned_manual.size(), 1, 1);
+
+  } else {
+
+    cudaMalloc((void **)&collapsed_blocks_gpu, collapsed_blocks_cpu.size() * sizeof(CollapsedBlock));
+    cudaMemcpy(collapsed_blocks_gpu, collapsed_blocks_cpu.data(), collapsed_blocks_cpu.size() * sizeof(CollapsedBlock), cudaMemcpyHostToDevice);
+  }
 
   // printf("Running kernel: (%d %d %d) x (%d %d %d)\n",
   //       collapsed_grid_dim.x, collapsed_grid_dim.y, collapsed_grid_dim.z,
