@@ -212,6 +212,21 @@ __global__ void SortChannelsSharedPreloadFloatCond(const SimpleSampleDesc<Out, I
       // tile[base_x] = sample.in[idx];
       tmp[base_x] = in[base_x];
     }
+
+    int iters = (block.end.x / 4 - block.start.x / 4) / blockDim.x;
+    // In case we are not divisible by 4, we need to process up to last 3 elements
+    // loop iters - we can count them, or have a counter, check which is faster
+    // TODO(klecki): Introduce alignment and padding, at least on the per-sample basis.
+
+    int64_t last_read = (block.end.x / 4) * 4 - 1;
+    int64_t last_written = last_read - block.start.x;
+
+    for (int64_t idx = threadIdx.x + last_read, base_x = threadIdx.x + last_written; idx < block.end.x; idx += blockDim.x, base_x += blockDim.x) {
+      // todo fast_div
+      // int c = idx % sample.C;
+      tile[base_x] = sample.in[idx];
+    }
+
   } else {
     for (int64_t idx = threadIdx.x + block.start.x, base_x = threadIdx.x; idx < block.end.x; idx += blockDim.x, base_x += blockDim.x) {
       // todo fast_div
@@ -333,7 +348,7 @@ __global__ void SliceNormalizeKernel_2D_NoPad(const SampleDesc<Out, In, 2> *samp
   SliceNormalizeKernel_2D_NoPad_Ch<static_channels>(sample, tile);
 }
 
-static constexpr int H = 25, W = 27, C = 3, NUM_ITERS = 100;
+static constexpr int H = 999, W = 999, C = 3, NUM_ITERS = 100;
 
 using input_t = uint8_t;
 using output_t = float;
@@ -410,6 +425,11 @@ void RunSN(int num_samples, input_t *input, output_t *output, float *norm_add, f
     auto sample_base = reinterpret_cast<uintptr_t>(simple_sample_desc[sample_idx].in);
     int start_alignment = sample_base % 4;  // TODO(sizeof(uint32_t))
 
+    // We can start at byte 0, 1, 2, 3, we want to move by the multiple of 3 channels to the
+    // 4-byte boundary, so we can move by, 0, 3, 6 or 9 respectively. and we
+    // add some kBlockWidth * 6 elements to do some processing in the first tile.
+    // All other tiles are divisible by 3 and 4, so they are both aligned with 4-byte boundary
+    // and with channels.
     static_assert(kBlockWidth % 4 == 0, "Block is already a multiple of alignment");
     int first_tile_from_alignment[4] = {0, 3 + kBlockWidth * 6, 6 + kBlockWidth * 6, 9 + kBlockWidth * 6};
 
