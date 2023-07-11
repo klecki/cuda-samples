@@ -605,6 +605,16 @@ int main(int argc, char **argv) {
   void (*kernel)(float *, float *, int, int);
   const char *kernelName;
 
+  // execution configuration parameters
+  dim3 grid(size_x / TILE_DIM, size_y / TILE_DIM),
+      threads(TILE_DIM, BLOCK_ROWS);
+
+  if (grid.x < 1 || grid.y < 1) {
+    printf("[%s] grid size computation incorrect in test \nExiting...\n\n",
+           sSDKsample);
+    exit(EXIT_FAILURE);
+  }
+
   // CUDA events
   cudaEvent_t start, stop;
 
@@ -702,24 +712,24 @@ int main(int argc, char **argv) {
     }
 
 
-    dim3 grid;
+    // dim3 grid;
 
-    dim3 threads;
+    // dim3 threads;
 
-    // execution configuration parameters
-    if (k == 1) {
-      grid = dim3(size_x / (TILE_DIM * kWidthMul), size_y / kTileHeight),
-      threads = dim3(32, 1);
-    } else {
-      grid = dim3(size_x / TILE_DIM, size_y / TILE_DIM),
-      threads = dim3(TILE_DIM, BLOCK_ROWS);
-    }
+    // // execution configuration parameters
+    // if (k == 1) {
+    //   grid = dim3(size_x / (TILE_DIM * kWidthMul), size_y / kTileHeight),
+    //   threads = dim3(32, 1);
+    // } else {
+    //   grid = dim3(size_x / TILE_DIM, size_y / TILE_DIM),
+    //   threads = dim3(TILE_DIM, BLOCK_ROWS);
+    // }
 
-    if (grid.x < 1 || grid.y < 1) {
-      printf("[%s] grid size computation incorrect in test \nExiting...\n\n",
-            sSDKsample);
-      exit(EXIT_FAILURE);
-    }
+    // if (grid.x < 1 || grid.y < 1) {
+    //   printf("[%s] grid size computation incorrect in test \nExiting...\n\n",
+    //         sSDKsample);
+    //   exit(EXIT_FAILURE);
+    // }
 
     // set reference solution
     if (kernel == &copy || kernel == &copySharedMem) {
@@ -789,7 +799,10 @@ int main(int argc, char **argv) {
   cudaFree(d_idata);
   cudaFree(d_odata);
 
-  dali::kernels::prepare_and_run(64);
+  dali::kernels::prepare_and_run(64, 1024, 1024, 3);
+
+
+  dali::kernels::prepare_and_run(64, 999, 999, 3);
 
   checkCudaErrors(cudaEventDestroy(start));
   checkCudaErrors(cudaEventDestroy(stop));

@@ -348,12 +348,12 @@ __global__ void SliceNormalizeKernel_2D_NoPad(const SampleDesc<Out, In, 2> *samp
   SliceNormalizeKernel_2D_NoPad_Ch<static_channels>(sample, tile);
 }
 
-static constexpr int H = 999, W = 999, C = 3, NUM_ITERS = 100;
+static constexpr int /*H = 999, W = 999, C = 3, */ NUM_ITERS = 100;
 
 using input_t = uint8_t;
 using output_t = float;
 
-void RunSN(int num_samples, input_t *input, output_t *output, float *norm_add, float *norm_mul, cudaStream_t stream, int id) {
+void RunSN(int num_samples, input_t *input, output_t *output, float *norm_add, float *norm_mul, cudaStream_t stream, int id, int H, int W, int C) {
   constexpr int spatial_ndim = 2;
   constexpr int channel_dim = 2;
   using Out = output_t;
@@ -533,7 +533,7 @@ void RunSN(int num_samples, input_t *input, output_t *output, float *norm_add, f
     SortChannelsSharedPreload<Out, In><<<collapsed_grid_dim, collapsed_block_dim, 0, stream>>>(simple_samples_gpu, collapsed_blocks_gpu);
   }
   if (id == 6) {
-    // SortChannelsSharedPreloadFloat<Out, In><<<collapsed_grid_dim, collapsed_block_dim, 0, stream>>>(simple_samples_gpu, collapsed_blocks_gpu);
+    SortChannelsSharedPreloadFloat<Out, In><<<collapsed_grid_dim, collapsed_block_dim, 0, stream>>>(simple_samples_gpu, collapsed_blocks_gpu);
   }
   if (id == 7) {
     SortChannelsSharedPreloadFloatCond<Out, In><<<collapsed_grid_dim, collapsed_block_dim, 0, stream>>>(simple_samples_gpu, collapsed_blocks_gpu);
@@ -572,7 +572,7 @@ void RunSN(int num_samples, input_t *input, output_t *output, float *norm_add, f
       SortChannelsSharedPreload<Out, In><<<collapsed_grid_dim, collapsed_block_dim, 0, stream>>>(simple_samples_gpu, collapsed_blocks_gpu);
     }
     if (id == 6) {
-      // SortChannelsSharedPreloadFloat<Out, In><<<collapsed_grid_dim, collapsed_block_dim, 0, stream>>>(simple_samples_gpu, collapsed_blocks_gpu);
+      SortChannelsSharedPreloadFloat<Out, In><<<collapsed_grid_dim, collapsed_block_dim, 0, stream>>>(simple_samples_gpu, collapsed_blocks_gpu);
     }
     if (id == 7) {
       SortChannelsSharedPreloadFloatCond<Out, In><<<collapsed_grid_dim, collapsed_block_dim, 0, stream>>>(simple_samples_gpu, collapsed_blocks_gpu);
@@ -589,10 +589,8 @@ void RunSN(int num_samples, input_t *input, output_t *output, float *norm_add, f
   float kernelBandwidth = num_samples * 1000.0f * (H * W * C * (sizeof(uint8_t) + sizeof(float))) / (1024 * 1024 * 1024) /
     (kernelTime / NUM_ITERS);
   printf(
-  "CMN %d, Throughput = %.4f GB/s, Time = %.5f ms, Size = %u fp32 "
-  "elements, NumDevsUsed = %u, Workgroup = %u\n",
-  id, kernelBandwidth, kernelTime / NUM_ITERS, (64 * 64),
-  1, 32 * 32);
+  "CMN %d, Throughput = %.4f GB/s, Time = %.5f ms, Size = %d x %d x %d\n",
+  id, kernelBandwidth, kernelTime / NUM_ITERS, H, W, C);
 
 
   checkCudaErrors(cudaEventDestroy(start));
@@ -603,7 +601,7 @@ void RunSN(int num_samples, input_t *input, output_t *output, float *norm_add, f
 }
 
 template <typename T>
-void print_planes(T *data) {
+void print_planes(T *data, int H, int W, int C) {
   for (int c = 0; c < C; c++) {
     printf("\n\nPlane: %d: =============\n", c);
     for (int y = 0; y < H; y++) {
@@ -615,7 +613,7 @@ void print_planes(T *data) {
   }
 }
 
-void prepare_and_run(int num_samples) {
+void prepare_and_run(int num_samples, int H, int W, int C) {
   input_t *input_gpu;
   output_t *output_gpu;
   float *norm_add_gpu, *norm_mul_gpu;
@@ -658,8 +656,12 @@ void prepare_and_run(int num_samples) {
   cudaStream_t stream;
   cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking);
   for (int id = 0; id < 8; id++) {
+    if (id == 6 && H * W * C % 4) {
+      printf("Unaligned version, skipping 6\n");
+      continue;
+    }
     cudaMemset(output_gpu, 0, num_samples * sizeof(output_t) * H * W * C);
-    RunSN(num_samples, input_gpu, output_gpu, norm_add_gpu, norm_mul_gpu, stream, id);
+    RunSN(num_samples, input_gpu, output_gpu, norm_add_gpu, norm_mul_gpu, stream, id, H, W, C);
 
     cudaMemcpy(output_cpu.data(), output_gpu, sizeof(output_t) * num_samples *  H * W * C, cudaMemcpyDeviceToHost);
     for (int i = 0; i < num_samples; i++) {
