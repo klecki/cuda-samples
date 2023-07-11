@@ -333,7 +333,7 @@ __global__ void SliceNormalizeKernel_2D_NoPad(const SampleDesc<Out, In, 2> *samp
   SliceNormalizeKernel_2D_NoPad_Ch<static_channels>(sample, tile);
 }
 
-static constexpr int H = 999, W = 999, C = 3, NUM_ITERS = 100;
+static constexpr int H = 25, W = 27, C = 3, NUM_ITERS = 100;
 
 using input_t = uint8_t;
 using output_t = float;
@@ -408,8 +408,13 @@ void RunSN(int num_samples, input_t *input, output_t *output, float *norm_add, f
   for (int sample_idx = 0; sample_idx < collapsed_shape.num_samples(); sample_idx++) {
     int64_t len = collapsed_shape.tensor_shape(sample_idx)[0];
     auto sample_base = reinterpret_cast<uintptr_t>(simple_sample_desc[sample_idx].in);
-    auto aligned_start = align_up(sample_base, kTileSize);
-    auto first_tile_size = aligned_start - sample_base;
+    int start_alignment = sample_base % 4;  // TODO(sizeof(uint32_t))
+
+    static_assert(kBlockWidth % 4 == 0, "Block is already a multiple of alignment");
+    int first_tile_from_alignment[4] = {0, 3 + kBlockWidth * 6, 6 + kBlockWidth * 6, 9 + kBlockWidth * 6};
+
+    // auto aligned_start = align_up(sample_base, kTileSize);
+    auto first_tile_size = first_tile_from_alignment[start_alignment];
     BlockDesc<1> blk;
     blk.sample_idx = sample_idx;
     blk.start[0] = 0;
@@ -639,9 +644,9 @@ void prepare_and_run(int num_samples) {
     cudaMemcpy(output_cpu.data(), output_gpu, sizeof(output_t) * num_samples *  H * W * C, cudaMemcpyDeviceToHost);
     for (int i = 0; i < num_samples; i++) {
       bool res = compareData(gold_cpu.data(), output_cpu.data() + i * H * W * C, H * W * C, 0.01f, 0.0f);
-      // printf("Expected:\n");
+      // printf("Expected: %d, sample %d\n", id, i);
       // print_planes(gold_cpu.data());
-      // printf("\n\n=============================================================\nComputed:\n");
+      // printf("\n\n=============================================================\nComputed: %d, sample %d\n", id, i);
       // print_planes(output_cpu.data() + i * H * W * C);
       if (res == false) {
         printf("*** %s kernel FAILED ***\n", "CMN");
