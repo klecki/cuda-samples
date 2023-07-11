@@ -96,31 +96,31 @@ __global__ void copy(float *odata, float *idata, int width, int height) {
 
 
 // TODO the loop over TILE_DIM doesn't make sense here
-// __global__ void copySharedMem(float *odata, float *idata, int width,
-//                               int height) {
-//   // Handle to thread block group
-//   cg::thread_block cta = cg::this_thread_block();
-//   __shared__ float tile[TILE_DIM][TILE_DIM];
+__global__ void copySharedMem(float *odata, float *idata, int width,
+                              int height) {
+  // Handle to thread block group
+  cg::thread_block cta = cg::this_thread_block();
+  __shared__ float tile[TILE_DIM][TILE_DIM];
 
-//   int xIndex = blockIdx.x * TILE_DIM + threadIdx.x;
-//   int yIndex = blockIdx.y * TILE_DIM + threadIdx.y;
+  int xIndex = blockIdx.x * TILE_DIM + threadIdx.x;
+  int yIndex = blockIdx.y * TILE_DIM + threadIdx.y;
 
-//   int index = xIndex + width * yIndex;
+  int index = xIndex + width * yIndex;
 
-//   for (int i = 0; i < TILE_DIM; i += BLOCK_ROWS) {
-//     if (xIndex < width && yIndex < height) {
-//       tile[threadIdx.y][threadIdx.x] = idata[index];
-//     }
-//   }
+  for (int i = 0; i < TILE_DIM; i += BLOCK_ROWS) {
+    if (xIndex < width && yIndex < height) {
+      tile[threadIdx.y][threadIdx.x] = idata[index];
+    }
+  }
 
-//   cg::sync(cta);
+  cg::sync(cta);
 
-//   for (int i = 0; i < TILE_DIM; i += BLOCK_ROWS) {
-//     if (xIndex < height && yIndex < width) {
-//       odata[index] = tile[threadIdx.y][threadIdx.x];
-//     }
-//   }
-// }
+  for (int i = 0; i < TILE_DIM; i += BLOCK_ROWS) {
+    if (xIndex < height && yIndex < width) {
+      odata[index] = tile[threadIdx.y][threadIdx.x];
+    }
+  }
+}
 
 constexpr int kTileHeight = 4;
 constexpr int kWidthMul = 2;
@@ -198,99 +198,99 @@ constexpr int kWidthMul = 2;
 // }
 
 
-__global__ void copySharedMem(float *odata, float *idata, int width,
-                              int height) {
+// __global__ void copySharedMem(float *odata, float *idata, int width,
+//                               int height) {
 
-  __shared__ float tile[kWidthMul * TILE_DIM * kTileHeight];
+//   __shared__ float tile[kWidthMul * TILE_DIM * kTileHeight];
 
-  auto group = cooperative_groups::this_thread_block();
-
-
-  constexpr unsigned stages_count = 2;
-
-  __shared__ cuda::barrier<cuda::thread_scope::thread_scope_block> barrier;
-  if (group.thread_rank() == 0) {
-      init(&barrier, group.size());
-  }
-  group.sync();
-  // Create a synchronization object (cuda::pipeline)
-  __shared__ cuda::pipeline_shared_state<cuda::thread_scope::thread_scope_block, stages_count> shared_state;
-  auto pipeline = cuda::make_pipeline(group, &shared_state);
+//   auto group = cooperative_groups::this_thread_block();
 
 
+//   constexpr unsigned stages_count = 2;
 
-  int yIndex = blockIdx.y * kTileHeight;
-  int xIndex_start = blockIdx.x * kWidthMul * TILE_DIM;
-  int tile_start = blockIdx.y * kTileHeight * width + blockIdx.x * kWidthMul * TILE_DIM;
-
-  // printf("Group size: %d \n", cta.size());
-
-  // assume that it is divisible, worry later
-  // if (xIndex < width && yIndex < height) {
-  //   tile[threadIdx.y * TILE_DIM + threadIdx.x] = idata[index];
-  //   // cg::memcpy_async(cta, tile,)
-  // }
-  int copy_width = min(kWidthMul * TILE_DIM, width - blockIdx.x * kWidthMul * TILE_DIM);
-  // constexpr int copy_width = kWidthMul * TILE_DIM;
-  // for (int y = yIndex, tileY = 0; yIndex < height && tileY < kTileHeight; y++, tileY++) {
-  //   cuda::memcpy_async(group, tile + tileY * kWidthMul * TILE_DIM, &idata[tile_start + tileY * width], sizeof(float) * copy_width, barrier);
-  // }
-
-  pipeline.producer_acquire();
-  cuda::memcpy_async(group, tile + 0 * kWidthMul * TILE_DIM, &idata[tile_start + 0 * width], sizeof(float) * copy_width, pipeline);
-  cuda::memcpy_async(group, tile + 1 * kWidthMul * TILE_DIM, &idata[tile_start + 1 * width], sizeof(float) * copy_width, pipeline);
-  pipeline.producer_commit(); // Commit the fetch-ahead stage
-
-  pipeline.producer_acquire();
-  cuda::memcpy_async(group, tile + 2 * kWidthMul * TILE_DIM, &idata[tile_start + 2 * width], sizeof(float) * copy_width, pipeline);
-  cuda::memcpy_async(group, tile + 3 * kWidthMul * TILE_DIM, &idata[tile_start + 3 * width], sizeof(float) * copy_width, pipeline);
-  pipeline.producer_commit(); // Commit the fetch-ahead stage
+//   __shared__ cuda::barrier<cuda::thread_scope::thread_scope_block> barrier;
+//   if (group.thread_rank() == 0) {
+//       init(&barrier, group.size());
+//   }
+//   group.sync();
+//   // Create a synchronization object (cuda::pipeline)
+//   __shared__ cuda::pipeline_shared_state<cuda::thread_scope::thread_scope_block, stages_count> shared_state;
+//   auto pipeline = cuda::make_pipeline(group, &shared_state);
 
 
 
-  // pipeline.consumer_wait(); // Wait for ‘subset’ stage to be available
-  // cuda::memcpy_async(group, &odata[tile_start + 0 * width], tile + 0 * kWidthMul* TILE_DIM, sizeof(float) * copy_width, barrier);
-  // cuda::memcpy_async(group, &odata[tile_start + 1 * width], tile + 1 * kWidthMul* TILE_DIM, sizeof(float) * copy_width, barrier);
-  // pipeline.consumer_release();
+//   int yIndex = blockIdx.y * kTileHeight;
+//   int xIndex_start = blockIdx.x * kWidthMul * TILE_DIM;
+//   int tile_start = blockIdx.y * kTileHeight * width + blockIdx.x * kWidthMul * TILE_DIM;
 
-  // pipeline.consumer_wait(); // Wait for ‘subset’ stage to be available
-  // cuda::memcpy_async(group, &odata[tile_start + 2 * width], tile + 2 * kWidthMul* TILE_DIM, sizeof(float) * copy_width, barrier);
-  // cuda::memcpy_async(group, &odata[tile_start + 3 * width], tile + 3 * kWidthMul* TILE_DIM, sizeof(float) * copy_width, barrier);
-  // pipeline.consumer_release();
+//   // printf("Group size: %d \n", cta.size());
+
+//   // assume that it is divisible, worry later
+//   // if (xIndex < width && yIndex < height) {
+//   //   tile[threadIdx.y * TILE_DIM + threadIdx.x] = idata[index];
+//   //   // cg::memcpy_async(cta, tile,)
+//   // }
+//   int copy_width = min(kWidthMul * TILE_DIM, width - blockIdx.x * kWidthMul * TILE_DIM);
+//   // constexpr int copy_width = kWidthMul * TILE_DIM;
+//   // for (int y = yIndex, tileY = 0; yIndex < height && tileY < kTileHeight; y++, tileY++) {
+//   //   cuda::memcpy_async(group, tile + tileY * kWidthMul * TILE_DIM, &idata[tile_start + tileY * width], sizeof(float) * copy_width, barrier);
+//   // }
+
+//   pipeline.producer_acquire();
+//   cuda::memcpy_async(group, tile + 0 * kWidthMul * TILE_DIM, &idata[tile_start + 0 * width], sizeof(float) * copy_width, pipeline);
+//   cuda::memcpy_async(group, tile + 1 * kWidthMul * TILE_DIM, &idata[tile_start + 1 * width], sizeof(float) * copy_width, pipeline);
+//   pipeline.producer_commit(); // Commit the fetch-ahead stage
+
+//   pipeline.producer_acquire();
+//   cuda::memcpy_async(group, tile + 2 * kWidthMul * TILE_DIM, &idata[tile_start + 2 * width], sizeof(float) * copy_width, pipeline);
+//   cuda::memcpy_async(group, tile + 3 * kWidthMul * TILE_DIM, &idata[tile_start + 3 * width], sizeof(float) * copy_width, pipeline);
+//   pipeline.producer_commit(); // Commit the fetch-ahead stage
 
 
-  // pipeline.consumer_wait(); // Wait for ‘subset’ stage to be available
-  // cuda::memcpy_async(group, &odata[tile_start + 0 * width], tile + 0 * kWidthMul* TILE_DIM, sizeof(float) * copy_width, pipeline);
-  // cuda::memcpy_async(group, &odata[tile_start + 1 * width], tile + 1 * kWidthMul* TILE_DIM, sizeof(float) * copy_width, pipeline);
-  // pipeline.consumer_release();
 
-  // pipeline.consumer_wait(); // Wait for ‘subset’ stage to be available
-  // cuda::memcpy_async(group, &odata[tile_start + 2 * width], tile + 2 * kWidthMul* TILE_DIM, sizeof(float) * copy_width, pipeline);
-  // cuda::memcpy_async(group, &odata[tile_start + 3 * width], tile + 3 * kWidthMul* TILE_DIM, sizeof(float) * copy_width, pipeline);
-  // pipeline.consumer_release();
+//   // pipeline.consumer_wait(); // Wait for ‘subset’ stage to be available
+//   // cuda::memcpy_async(group, &odata[tile_start + 0 * width], tile + 0 * kWidthMul* TILE_DIM, sizeof(float) * copy_width, barrier);
+//   // cuda::memcpy_async(group, &odata[tile_start + 1 * width], tile + 1 * kWidthMul* TILE_DIM, sizeof(float) * copy_width, barrier);
+//   // pipeline.consumer_release();
 
-  // cg::sync(cta);
-  // or:
-  // cta.sync();
+//   // pipeline.consumer_wait(); // Wait for ‘subset’ stage to be available
+//   // cuda::memcpy_async(group, &odata[tile_start + 2 * width], tile + 2 * kWidthMul* TILE_DIM, sizeof(float) * copy_width, barrier);
+//   // cuda::memcpy_async(group, &odata[tile_start + 3 * width], tile + 3 * kWidthMul* TILE_DIM, sizeof(float) * copy_width, barrier);
+//   // pipeline.consumer_release();
 
 
-  // if (xIndex < height && yIndex < width) {
-  //   odata[index] = tile[threadIdx.y * TILE_DIM + threadIdx.x];
-  // }
-  // barrier.arrive_and_wait(); // Wait for all copies to complete
-  for (int y = yIndex, tileY = 0; yIndex < height && tileY < kTileHeight; y++, tileY++) {
-    if (tileY % 2 == 0) {
-      pipeline.consumer_wait();
-    }
-    for (int x = xIndex_start + threadIdx.x, tileX = threadIdx.x; x < width && tileX < kWidthMul * TILE_DIM; x += TILE_DIM, tileX += TILE_DIM) {
-      odata[y * width +  x] = tile[tileY * kWidthMul* TILE_DIM + tileX];
-    }
-    if (tileY % 2 == 0) {
-      pipeline.consumer_release();
-    }
-    // cuda::memcpy_async(group, &odata[tile_start + tileY * width], tile + tileY * kWidthMul* TILE_DIM, sizeof(float) * copy_width, barrier);
-  }
-}
+//   // pipeline.consumer_wait(); // Wait for ‘subset’ stage to be available
+//   // cuda::memcpy_async(group, &odata[tile_start + 0 * width], tile + 0 * kWidthMul* TILE_DIM, sizeof(float) * copy_width, pipeline);
+//   // cuda::memcpy_async(group, &odata[tile_start + 1 * width], tile + 1 * kWidthMul* TILE_DIM, sizeof(float) * copy_width, pipeline);
+//   // pipeline.consumer_release();
+
+//   // pipeline.consumer_wait(); // Wait for ‘subset’ stage to be available
+//   // cuda::memcpy_async(group, &odata[tile_start + 2 * width], tile + 2 * kWidthMul* TILE_DIM, sizeof(float) * copy_width, pipeline);
+//   // cuda::memcpy_async(group, &odata[tile_start + 3 * width], tile + 3 * kWidthMul* TILE_DIM, sizeof(float) * copy_width, pipeline);
+//   // pipeline.consumer_release();
+
+//   // cg::sync(cta);
+//   // or:
+//   // cta.sync();
+
+
+//   // if (xIndex < height && yIndex < width) {
+//   //   odata[index] = tile[threadIdx.y * TILE_DIM + threadIdx.x];
+//   // }
+//   // barrier.arrive_and_wait(); // Wait for all copies to complete
+//   for (int y = yIndex, tileY = 0; yIndex < height && tileY < kTileHeight; y++, tileY++) {
+//     if (tileY % 2 == 0) {
+//       pipeline.consumer_wait();
+//     }
+//     for (int x = xIndex_start + threadIdx.x, tileX = threadIdx.x; x < width && tileX < kWidthMul * TILE_DIM; x += TILE_DIM, tileX += TILE_DIM) {
+//       odata[y * width +  x] = tile[tileY * kWidthMul* TILE_DIM + tileX];
+//     }
+//     if (tileY % 2 == 0) {
+//       pipeline.consumer_release();
+//     }
+//     // cuda::memcpy_async(group, &odata[tile_start + tileY * width], tile + tileY * kWidthMul* TILE_DIM, sizeof(float) * copy_width, barrier);
+//   }
+// }
 
 
 // -------------------------------------------------------
