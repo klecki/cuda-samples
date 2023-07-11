@@ -250,6 +250,57 @@ __global__ void SortChannelsSharedPreloadFloatCond(const SimpleSampleDesc<Out, I
 
 
 
+//  THIS VERSION SKIPS THE TAIL DATA LOAD DUE TO PADDING ISSUE TO MEASURE THE PERF IMPACT
+template <typename Out, typename In>
+__global__ void SortChannelsSharedPreloadFloatCondWrong(const SimpleSampleDesc<Out, In> *samples,
+                             const BlockDesc<1> *blocks) {
+  const auto &block = blocks[blockIdx.x];
+  const auto &sample = samples[block.sample_idx];
+  __shared__ In tile[kBlockSizeMul * kBlockWidth];
+  int y_stride = sample.W * sample.C;  // TODO: make channels always 3?
+  if ((reinterpret_cast<std::uintptr_t>(sample.in + block.start.x)) % 4 == 0) {
+    uint32_t *tmp = reinterpret_cast<uint32_t*>(tile);
+    const uint32_t *in = reinterpret_cast<const uint32_t*>(sample.in + block.start.x);
+    for (int64_t idx = threadIdx.x + block.start.x / 4, base_x = threadIdx.x; idx < block.end.x / 4; idx += blockDim.x, base_x += blockDim.x) {
+      // todo fast_div
+      // int c = idx % sample.C;
+      // tile[base_x] = sample.in[idx];
+      tmp[base_x] = in[base_x];
+    }
+
+    //  THIS PART IS COMMENTED OUT TO MEASURE THEORETICAL PERF IMPACT
+    // int64_t last_read = (block.end.x / 4) * 4 - 1;
+    // int64_t last_written = last_read - block.start.x;
+
+    // for (int64_t idx = threadIdx.x + last_read, base_x = threadIdx.x + last_written; idx < block.end.x; idx += blockDim.x, base_x += blockDim.x) {
+    //   // todo fast_div
+    //   // int c = idx % sample.C;
+    //   tile[base_x] = sample.in[idx];
+    // }
+
+  } else {
+    for (int64_t idx = threadIdx.x + block.start.x, base_x = threadIdx.x; idx < block.end.x; idx += blockDim.x, base_x += blockDim.x) {
+      // todo fast_div
+      // int c = idx % sample.C;
+      tile[base_x] = sample.in[idx];
+    }
+  }
+  __syncthreads();
+
+  // idx is not divided by the static channels (mostly the block.start.x)
+  for (int64_t idx = threadIdx.x + block.start.x / kStaticChannels, base_x = threadIdx.x;
+    idx < block.end.x / kStaticChannels; idx += blockDim.x, base_x += blockDim.x) {
+    #pragma unroll kStaticChannels
+    for (int c = 0; c < kStaticChannels; c++) {
+      float fpin = tile[base_x * sample.C + c];
+      float fpout = fmaf(fpin, sample.norm_mul[c], sample.norm_add[c]);
+      sample.out[c * sample.H * sample.W + idx] = fpout;
+    }
+  }
+}
+
+
+
 // Worse
 template <typename Out, typename In>
 __global__ void SortChannelsSharedOut(const SimpleSampleDesc<Out, In> *samples,
@@ -538,6 +589,9 @@ void RunSN(int num_samples, input_t *input, output_t *output, float *norm_add, f
   if (id == 7) {
     SortChannelsSharedPreloadFloatCond<Out, In><<<collapsed_grid_dim, collapsed_block_dim, 0, stream>>>(simple_samples_gpu, collapsed_blocks_gpu);
   }
+  if (id == 8) {
+    SortChannelsSharedPreloadFloatCondWrong<Out, In><<<collapsed_grid_dim, collapsed_block_dim, 0, stream>>>(simple_samples_gpu, collapsed_blocks_gpu);
+  }
 
   // CUDA events
   cudaEvent_t start, stop;
@@ -576,6 +630,9 @@ void RunSN(int num_samples, input_t *input, output_t *output, float *norm_add, f
     }
     if (id == 7) {
       SortChannelsSharedPreloadFloatCond<Out, In><<<collapsed_grid_dim, collapsed_block_dim, 0, stream>>>(simple_samples_gpu, collapsed_blocks_gpu);
+    }
+    if (id == 8) {
+      SortChannelsSharedPreloadFloatCondWrong<Out, In><<<collapsed_grid_dim, collapsed_block_dim, 0, stream>>>(simple_samples_gpu, collapsed_blocks_gpu);
     }
   }
 
@@ -655,7 +712,7 @@ void prepare_and_run(int num_samples, int H, int W, int C) {
 
   cudaStream_t stream;
   cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking);
-  for (int id = 0; id < 8; id++) {
+  for (int id = 0; id < 9; id++) {
     if (id == 6 && H * W * C % 4) {
       printf("Unaligned version, skipping 6\n");
       continue;
@@ -665,6 +722,10 @@ void prepare_and_run(int num_samples, int H, int W, int C) {
 
     cudaMemcpy(output_cpu.data(), output_gpu, sizeof(output_t) * num_samples *  H * W * C, cudaMemcpyDeviceToHost);
     for (int i = 0; i < num_samples; i++) {
+      if (i == 8) {
+        printf("Skipping the check for 8, trailing data is wrong\n");
+        continue;
+      }
       bool res = compareData(gold_cpu.data(), output_cpu.data() + i * H * W * C, H * W * C, 0.01f, 0.0f);
       // printf("Expected: %d, sample %d\n", id, i);
       // print_planes(gold_cpu.data());

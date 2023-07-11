@@ -808,10 +808,10 @@ int main(int argc, char **argv) {
   checkCudaErrors(cudaEventDestroy(stop));
 
   if (!success) {
-    printf("Test failed!\n");
+    printf("Transpose test failed!\n");
     exit(EXIT_FAILURE);
   }
 
-  printf("Test passed\n");
+  printf("Transpose test passed\n");
   exit(EXIT_SUCCESS);
 }
