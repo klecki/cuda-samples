@@ -6,6 +6,7 @@
 #include "dali/core/geom/vec.h"
 #include "dali/kernels/common/block_setup.h"
 #include "dali/core/fast_div.h"
+#include "dali/core/convert.h"
 
 // #include "dbg.h"
 
@@ -57,7 +58,7 @@ __device__ void SliceNormalizeKernel_2D_NoPad_Ch(const SampleDesc<Out, In, 2> &s
       for (int c = 0; c < static_channels; c++) {
         float fpin = sample.in(x, y, c);
         float fpout = fmaf(fpin, sample.norm_mul[c], sample.norm_add[c]);
-        sample.out(x, y, c) = fpout;  //TODO//ConvertSat<Out>(fpout);
+        sample.out(x, y, c) = ConvertSat<Out>(fpout);
       }
     }
   }
@@ -85,7 +86,7 @@ __global__ void SortChannels(const SimpleSampleDesc<Out, In> *samples,
     if (y < sample.H && x < sample.W) {
       float fpin = sample.in[idx];
       float fpout = fmaf(fpin, sample.norm_mul[c], sample.norm_add[c]);
-      sample.out[c * sample.H * sample.W + y * sample.W + x] = fpout;
+      sample.out[c * sample.H * sample.W + y * sample.W + x] = ConvertSat<Out>(fpout);
     }
   }
 }
@@ -108,7 +109,7 @@ __global__ void SortChannelsFastDiv(const SimpleSampleDesc<Out, In> *samples,
     if (y < sample.shape[0] && x < sample.shape[1]) {
       float fpin = sample.in[idx];
       float fpout = fmaf(fpin, sample.norm_mul[c], sample.norm_add[c]);
-      sample.out[c * sample.shape[0] * sample.shape[1] + y * sample.shape[1] + x] = fpout;
+      sample.out[c * sample.shape[0] * sample.shape[1] + y * sample.shape[1] + x] = ConvertSat<Out>(fpout);
     }
   }
 }
@@ -134,7 +135,7 @@ __global__ void SortChannelsSharedIn(const SimpleSampleDesc<Out, In> *samples,
     for (int c = 0; c < kStaticChannels; c++) {
       float fpin = tile[c][base_x];
       float fpout = fmaf(fpin, sample.norm_mul[c], sample.norm_add[c]);
-      sample.out[c * sample.H * sample.W + idx] = fpout;
+      sample.out[c * sample.H * sample.W + idx] = ConvertSat<Out>(fpout);
     }
   }
 }
@@ -161,7 +162,7 @@ __global__ void SortChannelsSharedPreload(const SimpleSampleDesc<Out, In> *sampl
     for (int c = 0; c < kStaticChannels; c++) {
       float fpin = tile[base_x * sample.C + c];
       float fpout = fmaf(fpin, sample.norm_mul[c], sample.norm_add[c]);
-      sample.out[c * sample.H * sample.W + idx] = fpout;
+      sample.out[c * sample.H * sample.W + idx] = ConvertSat<Out>(fpout);
     }
   }
 }
@@ -191,7 +192,7 @@ __global__ void SortChannelsSharedPreloadFloat(const SimpleSampleDesc<Out, In> *
     for (int c = 0; c < kStaticChannels; c++) {
       float fpin = tile[base_x * sample.C + c];
       float fpout = fmaf(fpin, sample.norm_mul[c], sample.norm_add[c]);
-      sample.out[c * sample.H * sample.W + idx] = fpout;
+      sample.out[c * sample.H * sample.W + idx] = ConvertSat<Out>(fpout);
     }
   }
 }
@@ -243,7 +244,7 @@ __global__ void SortChannelsSharedPreloadFloatCond(const SimpleSampleDesc<Out, I
     for (int c = 0; c < kStaticChannels; c++) {
       float fpin = tile[base_x * sample.C + c];
       float fpout = fmaf(fpin, sample.norm_mul[c], sample.norm_add[c]);
-      sample.out[c * sample.H * sample.W + idx] = fpout;
+      sample.out[c * sample.H * sample.W + idx] = ConvertSat<Out>(fpout);
     }
   }
 }
@@ -294,7 +295,7 @@ __global__ void SortChannelsSharedPreloadFloatCondWrong(const SimpleSampleDesc<O
     for (int c = 0; c < kStaticChannels; c++) {
       float fpin = tile[base_x * sample.C + c];
       float fpout = fmaf(fpin, sample.norm_mul[c], sample.norm_add[c]);
-      sample.out[c * sample.H * sample.W + idx] = fpout;
+      sample.out[c * sample.H * sample.W + idx] = ConvertSat<Out>(fpout);
     }
   }
 }
@@ -351,11 +352,68 @@ __global__ void SortChannelsSharedPreloadFloatPrologueEpilogue(const SimpleSampl
     for (int c = 0; c < kStaticChannels; c++) {
       float fpin = prologue_tile[base_x * sample.C + c];
       float fpout = fmaf(fpin, sample.norm_mul[c], sample.norm_add[c]);
-      sample.out[c * sample.H * sample.W + idx] = fpout;
+      // printf("%f %f\n", fpout, fpout);
+      sample.out[c * sample.H * sample.W + idx] = ConvertSat<Out>(fpout);
     }
   }
 }
 
+
+template <typename Out, typename In>
+__global__ void SortChannelsSharedPreloadFloatPrologueEpilogueBanks(const SimpleSampleDesc<Out, In> *samples,
+                             const BlockDesc<1> *blocks) {
+  const auto &block = blocks[blockIdx.x];
+  const auto &sample = samples[block.sample_idx];
+  __shared__ In tile[kBlockSizeMul * kBlockWidth + 33 * 4];
+
+  // TODO: assumes u8
+
+  auto in_start = reinterpret_cast<std::uintptr_t>(sample.in + block.start.x);
+  auto aligned_in_start = align_up(in_start, 32*4);
+  auto bytes_skipped = aligned_in_start - in_start;
+
+  In *aligned_tile = tile + 32 * 4;
+  In *prologue_tile = aligned_tile - bytes_skipped;
+  const In *prologue_in = sample.in + block.start.x;
+
+
+  uint32_t *aligned_tile_u32 = reinterpret_cast<uint32_t*>(aligned_tile);
+  const uint32_t *aligned_in_u32 = reinterpret_cast<const uint32_t*>(sample.in + block.start.x + bytes_skipped);
+
+  // prologue
+  for (int64_t idx = threadIdx.x; idx < bytes_skipped; idx += blockDim.x) {
+    prologue_tile[idx] = prologue_in[idx];
+  }
+
+  int64_t left_after_prologue = block.end.x - block.start.x - bytes_skipped;
+
+  // aligned load
+  for (int64_t idx = threadIdx.x; idx < left_after_prologue / 4; idx += blockDim.x) {
+    aligned_tile_u32[idx] = aligned_in_u32[idx];
+  }
+
+  // epilogue
+  In *epilogue_tile = reinterpret_cast<In*>(aligned_tile_u32 + left_after_prologue / 4);
+  const In *epilogue_in = reinterpret_cast<const In*>(aligned_in_u32 + left_after_prologue / 4);
+
+  int64_t left_after_main = left_after_prologue - (left_after_prologue /  4) * 4;
+  for (int64_t idx = threadIdx.x; idx < left_after_main; idx++) {
+    epilogue_tile[idx] = epilogue_in[idx];
+  }
+
+  __syncthreads();
+
+  // idx is not divided by the static channels (mostly the block.start.x)
+  for (int64_t idx = threadIdx.x + block.start.x / kStaticChannels, base_x = threadIdx.x;
+    idx < block.end.x / kStaticChannels; idx += blockDim.x, base_x += blockDim.x) {
+    #pragma unroll kStaticChannels
+    for (int c = 0; c < kStaticChannels; c++) {
+      float fpin = prologue_tile[base_x * sample.C + c];
+      float fpout = fmaf(fpin, sample.norm_mul[c], sample.norm_add[c]);
+      sample.out[c * sample.H * sample.W + idx] = ConvertSat<Out>(fpout);
+    }
+  }
+}
 
 
 
@@ -382,7 +440,7 @@ __global__ void SortChannelsSharedOut(const SimpleSampleDesc<Out, In> *samples,
     for (int c = 0; c < kStaticChannels; c++) {
       float fpin = tile[c][base_x];
       float fpout = fmaf(fpin, sample.norm_mul[c], sample.norm_add[c]);
-      sample.out[c * sample.H * sample.W + idx] = fpout;
+      sample.out[c * sample.H * sample.W + idx] = ConvertSat<Out>(fpout);
     }
   }
 }
@@ -408,7 +466,7 @@ __global__ void SortChannelsInPlace0(const SimpleSampleDesc<Out, In> *samples,
     for (int c = 0; c < kStaticChannels; c++) {
       float fpin = sample.in[idx * sample.C + c];
       float fpout = fmaf(fpin, sample.norm_mul[c], sample.norm_add[c]);
-      sample.out[c * sample.H * sample.W + idx] = fpout;
+      sample.out[c * sample.H * sample.W + idx] = ConvertSat<Out>(fpout);
     }
   }
 }
@@ -441,7 +499,7 @@ __global__ void SortChannelsInPlace1(const SimpleSampleDesc<Out, In> *samples,
     for (int c = 0; c < kStaticChannels; c++) {
       // float fpin = sample.in[idx * sample.C + c];
       float fpout = fmaf(fpin[c], sample.norm_mul[c], sample.norm_add[c]);
-      sample.out[c * sample.H * sample.W + idx] = fpout;
+      sample.out[c * sample.H * sample.W + idx] = ConvertSat<Out>(fpout);
     }
   }
 }
@@ -653,6 +711,9 @@ void RunSN(int num_samples, input_t *input, output_t *output, float *norm_add, f
   if (id == 9) {
     SortChannelsSharedPreloadFloatPrologueEpilogue<Out, In><<<collapsed_grid_dim, collapsed_block_dim, 0, stream>>>(simple_samples_gpu, collapsed_blocks_gpu);
   }
+  if (id == 10) {
+    SortChannelsSharedPreloadFloatPrologueEpilogueBanks<Out, In><<<collapsed_grid_dim, collapsed_block_dim, 0, stream>>>(simple_samples_gpu, collapsed_blocks_gpu);
+  }
 
 
   // CUDA events
@@ -699,6 +760,9 @@ void RunSN(int num_samples, input_t *input, output_t *output, float *norm_add, f
     if (id == 9) {
       SortChannelsSharedPreloadFloatPrologueEpilogue<Out, In><<<collapsed_grid_dim, collapsed_block_dim, 0, stream>>>(simple_samples_gpu, collapsed_blocks_gpu);
     }
+    if (id == 10) {
+      SortChannelsSharedPreloadFloatPrologueEpilogueBanks<Out, In><<<collapsed_grid_dim, collapsed_block_dim, 0, stream>>>(simple_samples_gpu, collapsed_blocks_gpu);
+    }
   }
 
 
@@ -728,7 +792,7 @@ void print_planes(T *data, int H, int W, int C) {
     printf("\n\nPlane: %d: =============\n", c);
     for (int y = 0; y < H; y++) {
       for (int x = 0; x < W; x++) {
-        printf("%d, ", static_cast<int32>(data[c * H * W + y * W + x]));
+        printf("%f, ", static_cast<float>(data[c * H * W + y * W + x]));
       }
       printf("|||\n");
     }
@@ -757,11 +821,11 @@ void prepare_and_run(int num_samples, int H, int W, int C) {
     input_cpu[i] = i;
   }
 
-  std::vector<input_t> gold_cpu;
+  std::vector<output_t> gold_cpu;
   gold_cpu.resize(H * W * C);
   for (int c = 0; c < C; c++) {
     for (int i = 0; i < H * W; i++) {
-      gold_cpu[c * H*W + i] = c + i * C;
+      gold_cpu[c * H*W + i] = ConvertSat<float>((c + i * C) % 256);
     }
   }
 
@@ -793,9 +857,9 @@ void prepare_and_run(int num_samples, int H, int W, int C) {
     for (int i = 0; i < num_samples; i++) {
       bool res = compareData(gold_cpu.data(), output_cpu.data() + i * H * W * C, H * W * C, 0.01f, 0.0f);
       // printf("Expected: %d, sample %d\n", id, i);
-      // print_planes(gold_cpu.data());
+      // print_planes(gold_cpu.data(), H, W, C);
       // printf("\n\n=============================================================\nComputed: %d, sample %d\n", id, i);
-      // print_planes(output_cpu.data() + i * H * W * C);
+      // print_planes(output_cpu.data() + i * H * W * C, H, W, C);
       if (res == false) {
         printf("*** %s kernel FAILED ***\n", "CMN");
       }
