@@ -311,7 +311,7 @@ __global__ void SortChannelsSharedPreloadFloatPrologueEpilogue(const SimpleSampl
   // TODO: assumes u8
 
   auto in_start = reinterpret_cast<std::uintptr_t>(sample.in + block.start.x);
-  auto aligned_in_start = align_up(in_start, 32*4);
+  auto aligned_in_start = align_up(in_start, 32 * 4);
   auto bytes_skipped = aligned_in_start - in_start;
 
   In *aligned_tile = tile + 32 * 4;
@@ -360,11 +360,11 @@ __global__ void SortChannelsSharedPreloadFloatPrologueEpilogue(const SimpleSampl
 
 
 template <typename Out, typename In>
-__global__ void SortChannelsSharedPreloadFloatPrologueEpilogueBanks(const SimpleSampleDesc<Out, In> *samples,
+__global__ void SortChannelsSharedPreloadFloatPrologueEpilogueF32(const SimpleSampleDesc<Out, In> *samples,
                              const BlockDesc<1> *blocks) {
   const auto &block = blocks[blockIdx.x];
   const auto &sample = samples[block.sample_idx];
-  __shared__ In tile[kBlockSizeMul * kBlockWidth + 33 * 4];
+  __shared__ float tile[kBlockSizeMul * kBlockWidth + 33 * 4];
 
   // TODO: assumes u8
 
@@ -372,13 +372,13 @@ __global__ void SortChannelsSharedPreloadFloatPrologueEpilogueBanks(const Simple
   auto aligned_in_start = align_up(in_start, 32*4);
   auto bytes_skipped = aligned_in_start - in_start;
 
-  In *aligned_tile = tile + 32 * 4;
-  In *prologue_tile = aligned_tile - bytes_skipped;
+  float *aligned_tile = tile + 32 * 4;
+  float *prologue_tile = aligned_tile - bytes_skipped;
   const In *prologue_in = sample.in + block.start.x;
 
 
-  uint32_t *aligned_tile_u32 = reinterpret_cast<uint32_t*>(aligned_tile);
-  const uint32_t *aligned_in_u32 = reinterpret_cast<const uint32_t*>(sample.in + block.start.x + bytes_skipped);
+  // float *aligned_tile_u32 = reinterpret_cast<uint32_t*>(aligned_tile);
+  const uchar4 *aligned_in_char4 = reinterpret_cast<const uchar4*>(sample.in + block.start.x + bytes_skipped);
 
   // prologue
   for (int64_t idx = threadIdx.x; idx < bytes_skipped; idx += blockDim.x) {
@@ -389,14 +389,20 @@ __global__ void SortChannelsSharedPreloadFloatPrologueEpilogueBanks(const Simple
 
   // aligned load
   for (int64_t idx = threadIdx.x; idx < left_after_prologue / 4; idx += blockDim.x) {
-    aligned_tile_u32[idx] = aligned_in_u32[idx];
+    uchar4 in = aligned_in_char4[idx];
+    aligned_tile[idx * 4 + 0] = in.x;
+    aligned_tile[idx * 4 + 1] = in.y;
+    aligned_tile[idx * 4 + 2] = in.z;
+    aligned_tile[idx * 4 + 3] = in.w;
   }
 
-  // epilogue
-  In *epilogue_tile = reinterpret_cast<In*>(aligned_tile_u32 + left_after_prologue / 4);
-  const In *epilogue_in = reinterpret_cast<const In*>(aligned_in_u32 + left_after_prologue / 4);
+  int64_t processed_in_main = (left_after_prologue /  4) * 4;
+  int64_t left_after_main = left_after_prologue - processed_in_main;
 
-  int64_t left_after_main = left_after_prologue - (left_after_prologue /  4) * 4;
+  // epilogue
+  float *epilogue_tile = aligned_tile + processed_in_main;
+  const In *epilogue_in = reinterpret_cast<const In*>(aligned_in_char4 + processed_in_main / 4);
+
   for (int64_t idx = threadIdx.x; idx < left_after_main; idx++) {
     epilogue_tile[idx] = epilogue_in[idx];
   }
@@ -712,7 +718,7 @@ void RunSN(int num_samples, input_t *input, output_t *output, float *norm_add, f
     SortChannelsSharedPreloadFloatPrologueEpilogue<Out, In><<<collapsed_grid_dim, collapsed_block_dim, 0, stream>>>(simple_samples_gpu, collapsed_blocks_gpu);
   }
   if (id == 10) {
-    SortChannelsSharedPreloadFloatPrologueEpilogueBanks<Out, In><<<collapsed_grid_dim, collapsed_block_dim, 0, stream>>>(simple_samples_gpu, collapsed_blocks_gpu);
+    SortChannelsSharedPreloadFloatPrologueEpilogueF32<Out, In><<<collapsed_grid_dim, collapsed_block_dim, 0, stream>>>(simple_samples_gpu, collapsed_blocks_gpu);
   }
 
 
@@ -761,7 +767,7 @@ void RunSN(int num_samples, input_t *input, output_t *output, float *norm_add, f
       SortChannelsSharedPreloadFloatPrologueEpilogue<Out, In><<<collapsed_grid_dim, collapsed_block_dim, 0, stream>>>(simple_samples_gpu, collapsed_blocks_gpu);
     }
     if (id == 10) {
-      SortChannelsSharedPreloadFloatPrologueEpilogueBanks<Out, In><<<collapsed_grid_dim, collapsed_block_dim, 0, stream>>>(simple_samples_gpu, collapsed_blocks_gpu);
+      SortChannelsSharedPreloadFloatPrologueEpilogueF32<Out, In><<<collapsed_grid_dim, collapsed_block_dim, 0, stream>>>(simple_samples_gpu, collapsed_blocks_gpu);
     }
   }
 
@@ -792,7 +798,7 @@ void print_planes(T *data, int H, int W, int C) {
     printf("\n\nPlane: %d: =============\n", c);
     for (int y = 0; y < H; y++) {
       for (int x = 0; x < W; x++) {
-        printf("%f, ", static_cast<float>(data[c * H * W + y * W + x]));
+        printf("%.0f, ", static_cast<float>(data[c * H * W + y * W + x]));
       }
       printf("|||\n");
     }
@@ -841,7 +847,7 @@ void prepare_and_run(int num_samples, int H, int W, int C) {
 
   cudaStream_t stream;
   cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking);
-  for (int id = 0; id < 10; id++) {
+  for (int id = 0; id < 11; id++) {
     if (id == 6 && H * W * C % 4) {
       printf("Unaligned version, skipping 6\n");
       continue;

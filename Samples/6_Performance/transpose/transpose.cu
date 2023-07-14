@@ -799,6 +799,8 @@ int main(int argc, char **argv) {
   cudaFree(d_idata);
   cudaFree(d_odata);
 
+  // dali::kernels::prepare_and_run(2, 33, 33, 3);
+
   dali::kernels::prepare_and_run(64, 1024, 1024, 3);
 
 

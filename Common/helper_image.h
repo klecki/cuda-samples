@@ -531,12 +531,12 @@ inline bool compareData(const T *reference, const U *data,
     error_count += !comp;
 
     // if (!comp) {
-    //   std::cerr << data[i] << ", ";
+    //   std::cout << data[i] << ", ";
     // } else {
-    //   std::cerr << "_, ";
+    //   std::cout << "_, ";
     // }
     // if (i % 100 == 0) {
-    //   std::cerr << std::endl;
+    //   std::cout << std::endl;
     // }
 #if 0
 
