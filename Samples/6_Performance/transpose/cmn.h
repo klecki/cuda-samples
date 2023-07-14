@@ -319,6 +319,9 @@ __global__ void SortChannelsSharedPreloadFloatPrologueEpilogue(const SimpleSampl
   __shared__ In tile[kBlockSizeMul * kBlockWidth + 33 * 4];
 
   float norm_mul[kStaticChannels], norm_add[kStaticChannels];
+  // int H = sample.H, W = sample.W, C = sample.C;
+  // const In* in = sample.in;
+  // Out *out = sample.out;
 
   #pragma unroll kStaticChannels
   for (int c = 0; c < kStaticChannels; c++) {
@@ -381,9 +384,20 @@ __global__ void SortChannelsSharedPreloadFloatPrologueEpilogue(const SimpleSampl
 template <typename Out, typename In>
 __global__ void SortChannelsSharedPreloadFloatPrologueEpilogueMirror(const SimpleSampleDesc<Out, In> *samples,
                              const BlockDesc<1> *blocks) {
-  const auto &block = blocks[blockIdx.x];
-  const auto &sample = samples[block.sample_idx];
+  const auto block = blocks[blockIdx.x];
+  const auto sample = samples[block.sample_idx];
   __shared__ In tile[kBlockSizeMul * kBlockWidth + 33 * 4];
+
+  float norm_mul[kStaticChannels], norm_add[kStaticChannels];
+  // int H = sample.H, W = sample.W, C = sample.C;
+  // const In* in = sample.in;
+  // Out *out = sample.out;
+
+  #pragma unroll kStaticChannels
+  for (int c = 0; c < kStaticChannels; c++) {
+    norm_mul[c] = sample.norm_mul[c];
+    norm_add[c] = sample.norm_add[c];
+  }
 
   // TODO: assumes u8
 
@@ -432,7 +446,7 @@ __global__ void SortChannelsSharedPreloadFloatPrologueEpilogueMirror(const Simpl
     #pragma unroll kStaticChannels
     for (int c = 0; c < kStaticChannels; c++) {
       float fpin = prologue_tile[base_x * sample.C + c];
-      float fpout = fmaf(fpin, sample.norm_mul[c], sample.norm_add[c]);
+      float fpout = fmaf(fpin, norm_mul[c], norm_add[c]);
       // printf("%f %f\n", fpout, fpout);
       sample.out[c * sample.H * sample.W + out_offset] = ConvertSat<Out>(fpout);
     }
@@ -1011,6 +1025,9 @@ void RunSN(int num_samples, input_t *input, output_t *output, float *norm_add, f
   if (id == 11) {
     SortChannelsSharedPreloadFloatPrologueEpilogueF32JustRead<Out, In><<<collapsed_grid_dim, collapsed_block_dim, 0, stream>>>(simple_samples_gpu, collapsed_blocks_gpu);
   }
+  if (id == 12) {
+    SortChannelsSharedPreloadFloatPrologueEpilogueMirror<Out, In><<<collapsed_grid_dim, collapsed_block_dim, 0, stream>>>(simple_samples_gpu, collapsed_blocks_gpu);
+  }
   // those do not work any better
   // if (id == 12) {
   //   SortChannelsSharedPreloadFloatPrologueEpilogueF32Align<Out, In><<<collapsed_grid_dim, collapsed_block_dim, 0, stream>>>(simple_samples_gpu, collapsed_blocks_gpu);
@@ -1069,6 +1086,9 @@ void RunSN(int num_samples, input_t *input, output_t *output, float *norm_add, f
     }
     if (id == 11) {
       SortChannelsSharedPreloadFloatPrologueEpilogueF32JustRead<Out, In><<<collapsed_grid_dim, collapsed_block_dim, 0, stream>>>(simple_samples_gpu, collapsed_blocks_gpu);
+    }
+    if (id == 12) {
+      SortChannelsSharedPreloadFloatPrologueEpilogueMirror<Out, In><<<collapsed_grid_dim, collapsed_block_dim, 0, stream>>>(simple_samples_gpu, collapsed_blocks_gpu);
     }
     // those do not work any better
     // if (id == 12) {
@@ -1155,8 +1175,8 @@ void prepare_and_run(int num_samples, int H, int W, int C) {
 
   cudaStream_t stream;
   cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking);
-  for (int id = 0; id < 12; id++) {
-    if (id == 6 && H * W * C % 4) {
+  for (int id = 0; id < 13; id++) {
+    if ((id == 6) && H * W * C % 4) {
       printf("Unaligned version, skipping 6\n");
       continue;
     }
@@ -1164,8 +1184,8 @@ void prepare_and_run(int num_samples, int H, int W, int C) {
     RunSN(num_samples, input_gpu, output_gpu, norm_add_gpu, norm_mul_gpu, stream, id, H, W, C);
 
     cudaMemcpy(output_cpu.data(), output_gpu, sizeof(output_t) * num_samples *  H * W * C, cudaMemcpyDeviceToHost);
-    if (id == 8) {
-      printf("Skipping the check for 8, trailing data is wrong\n");
+    if (id == 8 || id == 12) {
+      printf("Skipping the check for 8, trailing data is wrong, 12 - mirror draft\n");
       continue;
     }
     for (int i = 0; i < num_samples; i++) {
