@@ -992,12 +992,13 @@ void RunSN(int num_samples, input_t *input, output_t *output, float *norm_add, f
   if (id == 11) {
     SortChannelsSharedPreloadFloatPrologueEpilogueF32JustRead<Out, In><<<collapsed_grid_dim, collapsed_block_dim, 0, stream>>>(simple_samples_gpu, collapsed_blocks_gpu);
   }
-  if (id == 12) {
-    SortChannelsSharedPreloadFloatPrologueEpilogueF32Align<Out, In><<<collapsed_grid_dim, collapsed_block_dim, 0, stream>>>(simple_samples_gpu, collapsed_blocks_gpu);
-  }
-  if (id == 13) {
-    SortChannelsSharedPreloadFloatPrologueEpilogueF32Align2<Out, In><<<collapsed_grid_dim, collapsed_block_dim, 0, stream>>>(simple_samples_gpu, collapsed_blocks_gpu);
-  }
+  // those do not work any better
+  // if (id == 12) {
+  //   SortChannelsSharedPreloadFloatPrologueEpilogueF32Align<Out, In><<<collapsed_grid_dim, collapsed_block_dim, 0, stream>>>(simple_samples_gpu, collapsed_blocks_gpu);
+  // }
+  // if (id == 13) {
+  //   SortChannelsSharedPreloadFloatPrologueEpilogueF32Align2<Out, In><<<collapsed_grid_dim, collapsed_block_dim, 0, stream>>>(simple_samples_gpu, collapsed_blocks_gpu);
+  // }
 
 
   // CUDA events
@@ -1050,12 +1051,13 @@ void RunSN(int num_samples, input_t *input, output_t *output, float *norm_add, f
     if (id == 11) {
       SortChannelsSharedPreloadFloatPrologueEpilogueF32JustRead<Out, In><<<collapsed_grid_dim, collapsed_block_dim, 0, stream>>>(simple_samples_gpu, collapsed_blocks_gpu);
     }
-    if (id == 12) {
-      SortChannelsSharedPreloadFloatPrologueEpilogueF32Align<Out, In><<<collapsed_grid_dim, collapsed_block_dim, 0, stream>>>(simple_samples_gpu, collapsed_blocks_gpu);
-    }
-    if (id == 13) {
-      SortChannelsSharedPreloadFloatPrologueEpilogueF32Align2<Out, In><<<collapsed_grid_dim, collapsed_block_dim, 0, stream>>>(simple_samples_gpu, collapsed_blocks_gpu);
-    }
+    // those do not work any better
+    // if (id == 12) {
+    //   SortChannelsSharedPreloadFloatPrologueEpilogueF32Align<Out, In><<<collapsed_grid_dim, collapsed_block_dim, 0, stream>>>(simple_samples_gpu, collapsed_blocks_gpu);
+    // }
+    // if (id == 13) {
+    //   SortChannelsSharedPreloadFloatPrologueEpilogueF32Align2<Out, In><<<collapsed_grid_dim, collapsed_block_dim, 0, stream>>>(simple_samples_gpu, collapsed_blocks_gpu);
+    // }
   }
 
 
@@ -1134,7 +1136,7 @@ void prepare_and_run(int num_samples, int H, int W, int C) {
 
   cudaStream_t stream;
   cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking);
-  for (int id = 0; id < 14; id++) {
+  for (int id = 0; id < 12; id++) {
     if (id == 6 && H * W * C % 4) {
       printf("Unaligned version, skipping 6\n");
       continue;
