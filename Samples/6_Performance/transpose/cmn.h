@@ -308,6 +308,15 @@ __global__ void SortChannelsSharedPreloadFloatPrologueEpilogue(const SimpleSampl
   const auto &sample = samples[block.sample_idx];
   __shared__ In tile[kBlockSizeMul * kBlockWidth + 33 * 4];
 
+  float norm_mul[kStaticChannels], norm_add[kStaticChannels];
+
+  #pragma unroll kStaticChannels
+  for (int c = 0; c < kStaticChannels; c++) {
+    norm_mul[c] = sample.norm_mul[c];
+    norm_add[c] = sample.norm_add[c];
+  }
+
+
   // TODO: assumes u8
 
   auto in_start = reinterpret_cast<std::uintptr_t>(sample.in + block.start.x);
@@ -351,7 +360,7 @@ __global__ void SortChannelsSharedPreloadFloatPrologueEpilogue(const SimpleSampl
     #pragma unroll kStaticChannels
     for (int c = 0; c < kStaticChannels; c++) {
       float fpin = prologue_tile[base_x * sample.C + c];
-      float fpout = fmaf(fpin, sample.norm_mul[c], sample.norm_add[c]);
+      float fpout = fmaf(fpin, norm_mul[c], norm_add[c]);
       // printf("%f %f\n", fpout, fpout);
       sample.out[c * sample.H * sample.W + idx] = ConvertSat<Out>(fpout);
     }
