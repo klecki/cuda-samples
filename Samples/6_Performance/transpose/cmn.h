@@ -457,9 +457,17 @@ __global__ void SortChannelsSharedPreloadFloatPrologueEpilogueMirror(const Simpl
 template <typename Out, typename In>
 __global__ void SortChannelsSharedPreloadFloatPrologueEpilogueF32(const SimpleSampleDesc<Out, In> *samples,
                              const BlockDesc<1> *blocks) {
-  const auto &block = blocks[blockIdx.x];
-  const auto &sample = samples[block.sample_idx];
+  const auto block = blocks[blockIdx.x];
+  const auto sample = samples[block.sample_idx];
   __shared__ float tile[kBlockSizeMul * kBlockWidth + 33 * 4];
+
+  float norm_mul[kStaticChannels], norm_add[kStaticChannels];
+
+  #pragma unroll kStaticChannels
+  for (int c = 0; c < kStaticChannels; c++) {
+    norm_mul[c] = sample.norm_mul[c];
+    norm_add[c] = sample.norm_add[c];
+  }
 
   // TODO: assumes u8
 
@@ -510,7 +518,7 @@ __global__ void SortChannelsSharedPreloadFloatPrologueEpilogueF32(const SimpleSa
     #pragma unroll kStaticChannels
     for (int c = 0; c < kStaticChannels; c++) {
       float fpin = prologue_tile[base_x * sample.C + c];
-      float fpout = fmaf(fpin, sample.norm_mul[c], sample.norm_add[c]);
+      float fpout = fmaf(fpin, norm_mul[c], norm_add[c]);
       sample.out[c * sample.H * sample.W + idx] = ConvertSat<Out>(fpout);
     }
   }
