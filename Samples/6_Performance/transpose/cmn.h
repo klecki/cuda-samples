@@ -89,8 +89,15 @@ __device__ void sort_channels_hwc_to_chw(const SimpleSampleDesc<Out, In> &sample
 template <typename Out, typename In>
 __global__ void SortChannels(const SimpleSampleDesc<Out, In> *samples,
                              const BlockDesc<1> *blocks) {
-  const auto &block = blocks[blockIdx.x];
-  const auto &sample = samples[block.sample_idx];
+  const auto block = blocks[blockIdx.x];
+  const auto sample = samples[block.sample_idx];
+  float norm_mul[kStaticChannels], norm_add[kStaticChannels];
+
+  #pragma unroll kStaticChannels
+  for (int c = 0; c < kStaticChannels; c++) {
+    norm_mul[c] = sample.norm_mul[c];
+    norm_add[c] = sample.norm_add[c];
+  }
   // SliceNormalizeKernel_2D_NoPad_Ch<static_channels>(sample, tile);
   int y_stride = sample.W * sample.C;  // TODO: make channels always 3?
   for (int64_t idx = threadIdx.x + block.start.x; idx < block.end.x; idx += blockDim.x) {
@@ -101,7 +108,7 @@ __global__ void SortChannels(const SimpleSampleDesc<Out, In> *samples,
     int c = y_rem - x * sample.C;
     if (y < sample.H && x < sample.W) {
       float fpin = sample.in[idx];
-      float fpout = fmaf(fpin, sample.norm_mul[c], sample.norm_add[c]);
+      float fpout = fmaf(fpin, norm_mul[c], norm_add[c]);
       sample.out[c * sample.H * sample.W + y * sample.W + x] = ConvertSat<Out>(fpout);
     }
   }
@@ -111,8 +118,15 @@ __global__ void SortChannels(const SimpleSampleDesc<Out, In> *samples,
 template <typename Out, typename In>
 __global__ void SortChannelsFastDiv(const SimpleSampleDesc<Out, In> *samples,
                              const BlockDesc<1> *blocks) {
-  const auto &block = blocks[blockIdx.x];
-  const auto &sample = samples[block.sample_idx];
+  const auto block = blocks[blockIdx.x];
+  const auto sample = samples[block.sample_idx];
+  float norm_mul[kStaticChannels], norm_add[kStaticChannels];
+
+  #pragma unroll kStaticChannels
+  for (int c = 0; c < kStaticChannels; c++) {
+    norm_mul[c] = sample.norm_mul[c];
+    norm_add[c] = sample.norm_add[c];
+  }
   // SliceNormalizeKernel_2D_NoPad_Ch<static_channels>(sample, tile);
   int y_stride_ = sample.shape[1] * sample.shape[2];  // TODO: make channels always 3?
   fast_div<uint32_t> y_stride(y_stride_);
@@ -124,7 +138,7 @@ __global__ void SortChannelsFastDiv(const SimpleSampleDesc<Out, In> *samples,
     x = div_mod(c, y_rem, x_stride);
     if (y < sample.shape[0] && x < sample.shape[1]) {
       float fpin = sample.in[idx];
-      float fpout = fmaf(fpin, sample.norm_mul[c], sample.norm_add[c]);
+      float fpout = fmaf(fpin, norm_mul[c], norm_add[c]);
       sample.out[c * sample.shape[0] * sample.shape[1] + y * sample.shape[1] + x] = ConvertSat<Out>(fpout);
     }
   }
@@ -133,8 +147,15 @@ __global__ void SortChannelsFastDiv(const SimpleSampleDesc<Out, In> *samples,
 template <typename Out, typename In>
 __global__ void SortChannelsSharedIn(const SimpleSampleDesc<Out, In> *samples,
                              const BlockDesc<1> *blocks) {
-  const auto &block = blocks[blockIdx.x];
-  const auto &sample = samples[block.sample_idx];
+  const auto block = blocks[blockIdx.x];
+  const auto sample = samples[block.sample_idx];
+  float norm_mul[kStaticChannels], norm_add[kStaticChannels];
+
+  #pragma unroll kStaticChannels
+  for (int c = 0; c < kStaticChannels; c++) {
+    norm_mul[c] = sample.norm_mul[c];
+    norm_add[c] = sample.norm_add[c];
+  }
   __shared__ In tile[kStaticChannels][(kBlockSizeMul / kStaticChannels) * kBlockWidth];
   int y_stride = sample.W * sample.C;  // TODO: make channels always 3?
   for (int64_t idx = threadIdx.x + block.start.x, base_x = threadIdx.x; idx < block.end.x; idx += blockDim.x, base_x += blockDim.x) {
@@ -150,7 +171,7 @@ __global__ void SortChannelsSharedIn(const SimpleSampleDesc<Out, In> *samples,
     #pragma unroll kStaticChannels
     for (int c = 0; c < kStaticChannels; c++) {
       float fpin = tile[c][base_x];
-      float fpout = fmaf(fpin, sample.norm_mul[c], sample.norm_add[c]);
+      float fpout = fmaf(fpin, norm_mul[c], norm_add[c]);
       sample.out[c * sample.H * sample.W + idx] = ConvertSat<Out>(fpout);
     }
   }
@@ -160,8 +181,15 @@ __global__ void SortChannelsSharedIn(const SimpleSampleDesc<Out, In> *samples,
 template <typename Out, typename In>
 __global__ void SortChannelsSharedPreload(const SimpleSampleDesc<Out, In> *samples,
                              const BlockDesc<1> *blocks) {
-  const auto &block = blocks[blockIdx.x];
-  const auto &sample = samples[block.sample_idx];
+  const auto block = blocks[blockIdx.x];
+  const auto sample = samples[block.sample_idx];
+  float norm_mul[kStaticChannels], norm_add[kStaticChannels];
+
+  #pragma unroll kStaticChannels
+  for (int c = 0; c < kStaticChannels; c++) {
+    norm_mul[c] = sample.norm_mul[c];
+    norm_add[c] = sample.norm_add[c];
+  }
   __shared__ In tile[kBlockSizeMul * kBlockWidth];
   int y_stride = sample.W * sample.C;  // TODO: make channels always 3?
   for (int64_t idx = threadIdx.x + block.start.x, base_x = threadIdx.x; idx < block.end.x; idx += blockDim.x, base_x += blockDim.x) {
@@ -177,7 +205,7 @@ __global__ void SortChannelsSharedPreload(const SimpleSampleDesc<Out, In> *sampl
     #pragma unroll kStaticChannels
     for (int c = 0; c < kStaticChannels; c++) {
       float fpin = tile[base_x * sample.C + c];
-      float fpout = fmaf(fpin, sample.norm_mul[c], sample.norm_add[c]);
+      float fpout = fmaf(fpin, norm_mul[c], norm_add[c]);
       sample.out[c * sample.H * sample.W + idx] = ConvertSat<Out>(fpout);
     }
   }
@@ -187,8 +215,15 @@ __global__ void SortChannelsSharedPreload(const SimpleSampleDesc<Out, In> *sampl
 template <typename Out, typename In>
 __global__ void SortChannelsSharedPreloadFloat(const SimpleSampleDesc<Out, In> *samples,
                              const BlockDesc<1> *blocks) {
-  const auto &block = blocks[blockIdx.x];
-  const auto &sample = samples[block.sample_idx];
+  const auto block = blocks[blockIdx.x];
+  const auto sample = samples[block.sample_idx];
+  float norm_mul[kStaticChannels], norm_add[kStaticChannels];
+
+  #pragma unroll kStaticChannels
+  for (int c = 0; c < kStaticChannels; c++) {
+    norm_mul[c] = sample.norm_mul[c];
+    norm_add[c] = sample.norm_add[c];
+  }
   __shared__ In tile[kBlockSizeMul * kBlockWidth];
   int y_stride = sample.W * sample.C;  // TODO: make channels always 3?
   uint32_t *tmp = reinterpret_cast<uint32_t*>(tile);
@@ -207,7 +242,7 @@ __global__ void SortChannelsSharedPreloadFloat(const SimpleSampleDesc<Out, In> *
     #pragma unroll kStaticChannels
     for (int c = 0; c < kStaticChannels; c++) {
       float fpin = tile[base_x * sample.C + c];
-      float fpout = fmaf(fpin, sample.norm_mul[c], sample.norm_add[c]);
+      float fpout = fmaf(fpin, norm_mul[c], norm_add[c]);
       sample.out[c * sample.H * sample.W + idx] = ConvertSat<Out>(fpout);
     }
   }
@@ -216,8 +251,15 @@ __global__ void SortChannelsSharedPreloadFloat(const SimpleSampleDesc<Out, In> *
 template <typename Out, typename In>
 __global__ void SortChannelsSharedPreloadFloatCond(const SimpleSampleDesc<Out, In> *samples,
                              const BlockDesc<1> *blocks) {
-  const auto &block = blocks[blockIdx.x];
-  const auto &sample = samples[block.sample_idx];
+  const auto block = blocks[blockIdx.x];
+  const auto sample = samples[block.sample_idx];
+  float norm_mul[kStaticChannels], norm_add[kStaticChannels];
+
+  #pragma unroll kStaticChannels
+  for (int c = 0; c < kStaticChannels; c++) {
+    norm_mul[c] = sample.norm_mul[c];
+    norm_add[c] = sample.norm_add[c];
+  }
   __shared__ In tile[kBlockSizeMul * kBlockWidth];
   int y_stride = sample.W * sample.C;  // TODO: make channels always 3?
   if ((reinterpret_cast<std::uintptr_t>(sample.in + block.start.x)) % 4 == 0) {
@@ -259,7 +301,7 @@ __global__ void SortChannelsSharedPreloadFloatCond(const SimpleSampleDesc<Out, I
     #pragma unroll kStaticChannels
     for (int c = 0; c < kStaticChannels; c++) {
       float fpin = tile[base_x * sample.C + c];
-      float fpout = fmaf(fpin, sample.norm_mul[c], sample.norm_add[c]);
+      float fpout = fmaf(fpin, norm_mul[c], norm_add[c]);
       sample.out[c * sample.H * sample.W + idx] = ConvertSat<Out>(fpout);
     }
   }
@@ -271,8 +313,15 @@ __global__ void SortChannelsSharedPreloadFloatCond(const SimpleSampleDesc<Out, I
 template <typename Out, typename In>
 __global__ void SortChannelsSharedPreloadFloatCondWrong(const SimpleSampleDesc<Out, In> *samples,
                              const BlockDesc<1> *blocks) {
-  const auto &block = blocks[blockIdx.x];
-  const auto &sample = samples[block.sample_idx];
+  const auto block = blocks[blockIdx.x];
+  const auto sample = samples[block.sample_idx];
+  float norm_mul[kStaticChannels], norm_add[kStaticChannels];
+
+  #pragma unroll kStaticChannels
+  for (int c = 0; c < kStaticChannels; c++) {
+    norm_mul[c] = sample.norm_mul[c];
+    norm_add[c] = sample.norm_add[c];
+  }
   __shared__ In tile[kBlockSizeMul * kBlockWidth];
   int y_stride = sample.W * sample.C;  // TODO: make channels always 3?
   if ((reinterpret_cast<std::uintptr_t>(sample.in + block.start.x)) % 4 == 0) {
@@ -310,7 +359,7 @@ __global__ void SortChannelsSharedPreloadFloatCondWrong(const SimpleSampleDesc<O
     #pragma unroll kStaticChannels
     for (int c = 0; c < kStaticChannels; c++) {
       float fpin = tile[base_x * sample.C + c];
-      float fpout = fmaf(fpin, sample.norm_mul[c], sample.norm_add[c]);
+      float fpout = fmaf(fpin, norm_mul[c], norm_add[c]);
       sample.out[c * sample.H * sample.W + idx] = ConvertSat<Out>(fpout);
     }
   }
@@ -320,8 +369,8 @@ __global__ void SortChannelsSharedPreloadFloatCondWrong(const SimpleSampleDesc<O
 template <typename Out, typename In>
 __global__ void SortChannelsSharedPreloadFloatPrologueEpilogue(const SimpleSampleDesc<Out, In> *samples,
                              const BlockDesc<1> *blocks) {
-  const auto &block = blocks[blockIdx.x];
-  const auto &sample = samples[block.sample_idx];
+  const auto block = blocks[blockIdx.x];
+  const auto sample = samples[block.sample_idx];
   __shared__ In tile[kBlockSizeMul * kBlockWidth + 33 * 4];
 
   float norm_mul[kStaticChannels], norm_add[kStaticChannels];
@@ -389,8 +438,8 @@ __global__ void SortChannelsSharedPreloadFloatPrologueEpilogue(const SimpleSampl
 template <typename Out, typename In>
 __global__ void SortChannelsSharedPreloadFloatShortPrologueEpilogue(const SimpleSampleDesc<Out, In> *samples,
                              const BlockDesc<1> *blocks) {
-  const auto &block = blocks[blockIdx.x];
-  const auto &sample = samples[block.sample_idx];
+  const auto block = blocks[blockIdx.x];
+  const auto sample = samples[block.sample_idx];
   __shared__ In tile[kBlockSizeMul * kBlockWidth + 32 * 4];
 
   float norm_mul[kStaticChannels], norm_add[kStaticChannels];
@@ -759,8 +808,15 @@ __global__ void SortChannelsSharedPreloadFloatShortPrologueEpilogueF32(const Sim
 template <typename Out, typename In>
 __global__ void SortChannelsSharedPreloadFloatPrologueEpilogueF32JustRead(const SimpleSampleDesc<Out, In> *samples,
                              const BlockDesc<1> *blocks) {
-  const auto &block = blocks[blockIdx.x];
-  const auto &sample = samples[block.sample_idx];
+  const auto block = blocks[blockIdx.x];
+  const auto sample = samples[block.sample_idx];
+  float norm_mul[kStaticChannels], norm_add[kStaticChannels];
+
+  #pragma unroll kStaticChannels
+  for (int c = 0; c < kStaticChannels; c++) {
+    norm_mul[c] = sample.norm_mul[c];
+    norm_add[c] = sample.norm_add[c];
+  }
   __shared__ float tile[kBlockSizeMul * kBlockWidth + 33 * 4];
 
   // TODO: assumes u8
@@ -810,7 +866,7 @@ __global__ void SortChannelsSharedPreloadFloatPrologueEpilogueF32JustRead(const 
     int64_t plane_offset = idx / kStaticChannels;
     int c = idx - plane_offset * kStaticChannels;
     float fpin = prologue_tile[idx];
-    float fpout = fmaf(fpin, sample.norm_mul[c], sample.norm_add[c]);
+    float fpout = fmaf(fpin, norm_mul[c], norm_add[c]);
     sample.out[c * sample.H * sample.W + plane_offset + out_offset] = ConvertSat<Out>(fpout);
   }
 
@@ -820,7 +876,7 @@ __global__ void SortChannelsSharedPreloadFloatPrologueEpilogueF32JustRead(const 
   //   #pragma unroll kStaticChannels
   //   for (int c = 0; c < kStaticChannels; c++) {
   //     float fpin = prologue_tile[base_x * sample.C + c];
-  //     float fpout = fmaf(fpin, sample.norm_mul[c], sample.norm_add[c]);
+  //     float fpout = fmaf(fpin, norm_mul[c], norm_add[c]);
   //     sample.out[c * sample.H * sample.W + idx] = ConvertSat<Out>(fpout);
   //   }
   // }
@@ -829,8 +885,15 @@ __global__ void SortChannelsSharedPreloadFloatPrologueEpilogueF32JustRead(const 
 template <typename Out, typename In>
 __global__ void SortChannelsSharedPreloadFloatPrologueEpilogueF32Align(const SimpleSampleDesc<Out, In> *samples,
                              const BlockDesc<1> *blocks) {
-  const auto &block = blocks[blockIdx.x];
-  const auto &sample = samples[block.sample_idx];
+  const auto block = blocks[blockIdx.x];
+  const auto sample = samples[block.sample_idx];
+  float norm_mul[kStaticChannels], norm_add[kStaticChannels];
+
+  #pragma unroll kStaticChannels
+  for (int c = 0; c < kStaticChannels; c++) {
+    norm_mul[c] = sample.norm_mul[c];
+    norm_add[c] = sample.norm_add[c];
+  }
   __shared__ float tile[kBlockSizeMul * kBlockWidth + 33 * 4];
 
   // TODO: assumes u8
@@ -888,7 +951,7 @@ __global__ void SortChannelsSharedPreloadFloatPrologueEpilogueF32Align(const Sim
       fpin[i] = prologue_tile[source_offset];
       int64_t plane_offset = source_offset  / kStaticChannels;
       int c = source_offset - plane_offset * kStaticChannels;
-      float fpout = fmaf(fpin[i], sample.norm_mul[c], sample.norm_add[c]);
+      float fpout = fmaf(fpin[i], norm_mul[c], norm_add[c]);
       sample.out[c * sample.H * sample.W + plane_offset + out_offset] = ConvertSat<Out>(fpout);
     }
   }
@@ -897,8 +960,15 @@ __global__ void SortChannelsSharedPreloadFloatPrologueEpilogueF32Align(const Sim
 template <typename Out, typename In>
 __global__ void SortChannelsSharedPreloadFloatPrologueEpilogueF32Align2(const SimpleSampleDesc<Out, In> *samples,
                              const BlockDesc<1> *blocks) {
-  const auto &block = blocks[blockIdx.x];
-  const auto &sample = samples[block.sample_idx];
+  const auto block = blocks[blockIdx.x];
+  const auto sample = samples[block.sample_idx];
+  float norm_mul[kStaticChannels], norm_add[kStaticChannels];
+
+  #pragma unroll kStaticChannels
+  for (int c = 0; c < kStaticChannels; c++) {
+    norm_mul[c] = sample.norm_mul[c];
+    norm_add[c] = sample.norm_add[c];
+  }
   __shared__ float tile[kBlockSizeMul * kBlockWidth + 33 * 4];
 
   // TODO: assumes u8
@@ -959,7 +1029,7 @@ __global__ void SortChannelsSharedPreloadFloatPrologueEpilogueF32Align2(const Si
       int64_t source_offset = idx + i * blockDim.x;
       int64_t plane_offset = source_offset / kStaticChannels;
       int c = source_offset - plane_offset * kStaticChannels;
-      float fpout = fmaf(fpin[i], sample.norm_mul[c], sample.norm_add[c]);
+      float fpout = fmaf(fpin[i], norm_mul[c], norm_add[c]);
       sample.out[c * sample.H * sample.W + plane_offset + out_offset] = ConvertSat<Out>(fpout);
     }
   }
@@ -1037,12 +1107,128 @@ __global__ void SortChannelsSharedPreloadFloatPrologueEpilogueF32_U2(const Simpl
 
 
 
+
+template <typename Out, typename In>
+__global__ void SortChannelsSharedPreloadFloatPrologueEpilogueF32Crop(const SimpleSampleDesc<Out, In> *samples,
+                             const BlockDesc<1> *blocks) {
+  const auto block = blocks[blockIdx.x];
+  const auto sample = samples[block.sample_idx];
+  __shared__ float tile[kBlockSizeMul * kBlockWidth + 33 * 4];
+
+  float norm_mul[kStaticChannels], norm_add[kStaticChannels];
+
+  #pragma unroll kStaticChannels
+  for (int c = 0; c < kStaticChannels; c++) {
+    norm_mul[c] = sample.norm_mul[c];
+    norm_add[c] = sample.norm_add[c];
+  }
+
+  // TODO: assumes u8
+
+
+  // // calculate the "jump" to previous aligned
+  int in_stride = sample.input_W * sample.C;
+  int out_stride = sample.W * sample.C;
+
+  // // calculate output coordinate based on the flat indexing
+  // int64_t actual_index = idx * 4 + bytes_skipped;
+  // int y = actual_index / out_stride;
+  // int xc = actual_index - y * out_stride;
+  // int x = xc / sample.C;
+  // int c = xc - x * sample.C;
+
+  // if y == 0 -> we are in first row, calculate till last viable x or xc?
+  // int skip_writes = xc + 3 - out_stride ?
+  // if y == 1 -> add just the offset from first row, to back-alginment, skip preceding writes :C
+  // if y > 1 -> do the same, but probably with uniform skipping?
+
+  // for now, it looks super complicated. maybe let's do a width-loop?
+
+
+  // recalculate source offset
+
+
+  // left in row:
+  // int out_stride
+  // maybe it is actually easier to have a block loop
+  int y_start = block.start.x / out_stride;
+  int xc_start = block.start.x - y_start * out_stride;
+
+  // int left_in_row = std::min(block.end.x - block.start.x, );
+  // loop over row and reinitialize
+
+
+
+  auto in_start = reinterpret_cast<std::uintptr_t>(sample.in + block.start.x);
+  // align to 4
+  auto aligned_in_start = align_up(in_start, 4);
+  auto bytes_skipped = aligned_in_start - in_start;
+
+  float *aligned_tile = tile + 4;
+  float *prologue_tile = aligned_tile - bytes_skipped;
+  const In *prologue_in = sample.in + block.start.x;
+
+
+  // float *aligned_tile_u32 = reinterpret_cast<uint32_t*>(aligned_tile);
+  const uchar4 *aligned_in_char4 = reinterpret_cast<const uchar4*>(sample.in + block.start.x + bytes_skipped);
+
+  // prologue
+  for (int64_t idx = threadIdx.x; idx < bytes_skipped; idx += blockDim.x) {
+    prologue_tile[idx] = prologue_in[idx];
+  }
+
+  int64_t left_after_prologue = block.end.x - block.start.x - bytes_skipped;
+
+  // aligned load
+  for (int64_t idx = threadIdx.x; idx < left_after_prologue / 4; idx += blockDim.x) {
+    uchar4 in = aligned_in_char4[idx];
+    aligned_tile[idx * 4 + 0] = in.x;
+    aligned_tile[idx * 4 + 1] = in.y;
+    aligned_tile[idx * 4 + 2] = in.z;
+    aligned_tile[idx * 4 + 3] = in.w;
+  }
+
+  int64_t processed_in_main = (left_after_prologue /  4) * 4;
+  int64_t left_after_main = left_after_prologue - processed_in_main;
+
+  // epilogue
+  float *epilogue_tile = aligned_tile + processed_in_main;
+  const In *epilogue_in = reinterpret_cast<const In*>(aligned_in_char4 + processed_in_main / 4);
+
+  for (int64_t idx = threadIdx.x; idx < left_after_main; idx++) {
+    epilogue_tile[idx] = epilogue_in[idx];
+  }
+
+  __syncthreads();
+
+  // idx is not divided by the static channels (mostly the block.start.x)
+  for (int64_t idx = threadIdx.x + block.start.x / kStaticChannels, base_x = threadIdx.x;
+    idx < block.end.x / kStaticChannels; idx += blockDim.x, base_x += blockDim.x) {
+    #pragma unroll kStaticChannels
+    for (int c = 0; c < kStaticChannels; c++) {
+      float fpin = prologue_tile[base_x * sample.C + c];
+      float fpout = fmaf(fpin, norm_mul[c], norm_add[c]);
+      sample.out[c * sample.H * sample.W + idx] = ConvertSat<Out>(fpout);
+    }
+  }
+}
+
+
 // Worse
 template <typename Out, typename In>
 __global__ void SortChannelsSharedOut(const SimpleSampleDesc<Out, In> *samples,
                              const BlockDesc<1> *blocks) {
-  const auto &block = blocks[blockIdx.x];
-  const auto &sample = samples[block.sample_idx];
+  const auto block = blocks[blockIdx.x];
+  const auto sample = samples[block.sample_idx];
+
+  float norm_mul[kStaticChannels], norm_add[kStaticChannels];
+
+  #pragma unroll kStaticChannels
+  for (int c = 0; c < kStaticChannels; c++) {
+    norm_mul[c] = sample.norm_mul[c];
+    norm_add[c] = sample.norm_add[c];
+  }
+
   __shared__ Out tile[kStaticChannels][(kBlockSizeMul / kStaticChannels) * kBlockWidth];
   int y_stride = sample.W * sample.C;  // TODO: make channels always 3?
   for (int64_t idx = threadIdx.x + block.start.x, base_x = threadIdx.x; idx < block.end.x; idx += blockDim.x, base_x += blockDim.x) {
@@ -1059,7 +1245,7 @@ __global__ void SortChannelsSharedOut(const SimpleSampleDesc<Out, In> *samples,
     #pragma unroll kStaticChannels
     for (int c = 0; c < kStaticChannels; c++) {
       float fpin = tile[c][base_x];
-      float fpout = fmaf(fpin, sample.norm_mul[c], sample.norm_add[c]);
+      float fpout = fmaf(fpin, norm_mul[c], norm_add[c]);
       sample.out[c * sample.H * sample.W + idx] = ConvertSat<Out>(fpout);
     }
   }
@@ -1069,8 +1255,17 @@ __global__ void SortChannelsSharedOut(const SimpleSampleDesc<Out, In> *samples,
 template <typename Out, typename In>
 __global__ void SortChannelsInPlace0(const SimpleSampleDesc<Out, In> *samples,
                              const BlockDesc<1> *blocks) {
-  const auto &block = blocks[blockIdx.x];
-  const auto &sample = samples[block.sample_idx];
+  const auto block = blocks[blockIdx.x];
+  const auto sample = samples[block.sample_idx];
+
+  float norm_mul[kStaticChannels], norm_add[kStaticChannels];
+
+  #pragma unroll kStaticChannels
+  for (int c = 0; c < kStaticChannels; c++) {
+    norm_mul[c] = sample.norm_mul[c];
+    norm_add[c] = sample.norm_add[c];
+  }
+
   // __shared__ Out tile[kStaticChannels][(kBlockSizeMul / kStaticChannels) * kBlockWidth];
   // int y_stride = sample.W * sample.C;  // TODO: make channels always 3?
   // for (int64_t idx = threadIdx.x + block.start.x, base_x = threadIdx.x; idx < block.end.x; idx += blockDim.x, base_x += blockDim.x) {
@@ -1085,7 +1280,7 @@ __global__ void SortChannelsInPlace0(const SimpleSampleDesc<Out, In> *samples,
     #pragma unroll kStaticChannels
     for (int c = 0; c < kStaticChannels; c++) {
       float fpin = sample.in[idx * sample.C + c];
-      float fpout = fmaf(fpin, sample.norm_mul[c], sample.norm_add[c]);
+      float fpout = fmaf(fpin, norm_mul[c], norm_add[c]);
       sample.out[c * sample.H * sample.W + idx] = ConvertSat<Out>(fpout);
     }
   }
@@ -1094,8 +1289,17 @@ __global__ void SortChannelsInPlace0(const SimpleSampleDesc<Out, In> *samples,
 template <typename Out, typename In>
 __global__ void SortChannelsInPlace1(const SimpleSampleDesc<Out, In> *samples,
                              const BlockDesc<1> *blocks) {
-  const auto &block = blocks[blockIdx.x];
-  const auto &sample = samples[block.sample_idx];
+  const auto block = blocks[blockIdx.x];
+  const auto sample = samples[block.sample_idx];
+
+  float norm_mul[kStaticChannels], norm_add[kStaticChannels];
+
+  #pragma unroll kStaticChannels
+  for (int c = 0; c < kStaticChannels; c++) {
+    norm_mul[c] = sample.norm_mul[c];
+    norm_add[c] = sample.norm_add[c];
+  }
+
   // __shared__ Out tile[kStaticChannels][(kBlockSizeMul / kStaticChannels) * kBlockWidth];
   // int y_stride = sample.W * sample.C;  // TODO: make channels always 3?
   // for (int64_t idx = threadIdx.x + block.start.x, base_x = threadIdx.x; idx < block.end.x; idx += blockDim.x, base_x += blockDim.x) {
@@ -1118,7 +1322,7 @@ __global__ void SortChannelsInPlace1(const SimpleSampleDesc<Out, In> *samples,
     #pragma unroll kStaticChannels
     for (int c = 0; c < kStaticChannels; c++) {
       // float fpin = sample.in[idx * sample.C + c];
-      float fpout = fmaf(fpin[c], sample.norm_mul[c], sample.norm_add[c]);
+      float fpout = fmaf(fpin[c], norm_mul[c], norm_add[c]);
       sample.out[c * sample.H * sample.W + idx] = ConvertSat<Out>(fpout);
     }
   }
