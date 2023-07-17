@@ -593,6 +593,77 @@ __global__ void SortChannelsSharedPreloadFloatPrologueEpilogueF32(const SimpleSa
   }
 }
 
+
+template <typename Out, typename In>
+__global__ void SortChannelsSharedPreloadFloatShortPrologueEpilogueF32(const SimpleSampleDesc<Out, In> *samples,
+                             const BlockDesc<1> *blocks) {
+  const auto block = blocks[blockIdx.x];
+  const auto sample = samples[block.sample_idx];
+  __shared__ float tile[kBlockSizeMul * kBlockWidth + 32 * 4];
+
+  float norm_mul[kStaticChannels], norm_add[kStaticChannels];
+
+  #pragma unroll kStaticChannels
+  for (int c = 0; c < kStaticChannels; c++) {
+    norm_mul[c] = sample.norm_mul[c];
+    norm_add[c] = sample.norm_add[c];
+  }
+
+  // TODO: assumes u8
+
+  auto in_start = reinterpret_cast<std::uintptr_t>(sample.in + block.start.x);
+  auto aligned_in_start = align_up(in_start, 4);
+  auto bytes_skipped = aligned_in_start - in_start;
+
+  float *aligned_tile = tile + 4;
+  float *prologue_tile = aligned_tile - bytes_skipped;
+  const In *prologue_in = sample.in + block.start.x;
+
+
+  // float *aligned_tile_u32 = reinterpret_cast<uint32_t*>(aligned_tile);
+  const uchar4 *aligned_in_char4 = reinterpret_cast<const uchar4*>(sample.in + block.start.x + bytes_skipped);
+
+  // prologue
+  for (int64_t idx = threadIdx.x; idx < bytes_skipped; idx += blockDim.x) {
+    prologue_tile[idx] = prologue_in[idx];
+  }
+
+  int64_t left_after_prologue = block.end.x - block.start.x - bytes_skipped;
+
+  // aligned load
+  for (int64_t idx = threadIdx.x; idx < left_after_prologue / 4; idx += blockDim.x) {
+    uchar4 in = aligned_in_char4[idx];
+    aligned_tile[idx * 4 + 0] = in.x;
+    aligned_tile[idx * 4 + 1] = in.y;
+    aligned_tile[idx * 4 + 2] = in.z;
+    aligned_tile[idx * 4 + 3] = in.w;
+  }
+
+  int64_t processed_in_main = (left_after_prologue /  4) * 4;
+  int64_t left_after_main = left_after_prologue - processed_in_main;
+
+  // epilogue
+  float *epilogue_tile = aligned_tile + processed_in_main;
+  const In *epilogue_in = reinterpret_cast<const In*>(aligned_in_char4 + processed_in_main / 4);
+
+  for (int64_t idx = threadIdx.x; idx < left_after_main; idx++) {
+    epilogue_tile[idx] = epilogue_in[idx];
+  }
+
+  __syncthreads();
+
+  // idx is not divided by the static channels (mostly the block.start.x)
+  for (int64_t idx = threadIdx.x + block.start.x / kStaticChannels, base_x = threadIdx.x;
+    idx < block.end.x / kStaticChannels; idx += blockDim.x, base_x += blockDim.x) {
+    #pragma unroll kStaticChannels
+    for (int c = 0; c < kStaticChannels; c++) {
+      float fpin = prologue_tile[base_x * sample.C + c];
+      float fpout = fmaf(fpin, norm_mul[c], norm_add[c]);
+      sample.out[c * sample.H * sample.W + idx] = ConvertSat<Out>(fpout);
+    }
+  }
+}
+
 template <typename Out, typename In>
 __global__ void SortChannelsSharedPreloadFloatPrologueEpilogueF32JustRead(const SimpleSampleDesc<Out, In> *samples,
                              const BlockDesc<1> *blocks) {
@@ -1108,6 +1179,9 @@ void RunSN(int num_samples, input_t *input, output_t *output, float *norm_add, f
   if (id == 13) {
     SortChannelsSharedPreloadFloatShortPrologueEpilogue<Out, In><<<collapsed_grid_dim, collapsed_block_dim, 0, stream>>>(simple_samples_gpu, collapsed_blocks_gpu);
   }
+  if (id == 14) {
+    SortChannelsSharedPreloadFloatShortPrologueEpilogueF32<Out, In><<<collapsed_grid_dim, collapsed_block_dim, 0, stream>>>(simple_samples_gpu, collapsed_blocks_gpu);
+  }
 
 
   // those do not work any better
@@ -1174,6 +1248,9 @@ void RunSN(int num_samples, input_t *input, output_t *output, float *norm_add, f
     }
     if (id == 13) {
       SortChannelsSharedPreloadFloatShortPrologueEpilogue<Out, In><<<collapsed_grid_dim, collapsed_block_dim, 0, stream>>>(simple_samples_gpu, collapsed_blocks_gpu);
+    }
+    if (id == 14) {
+      SortChannelsSharedPreloadFloatShortPrologueEpilogueF32<Out, In><<<collapsed_grid_dim, collapsed_block_dim, 0, stream>>>(simple_samples_gpu, collapsed_blocks_gpu);
     }
   }
 
@@ -1253,7 +1330,7 @@ void prepare_and_run(int num_samples, int H, int W, int C) {
 
   cudaStream_t stream;
   cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking);
-  for (int id = 0; id < 14; id++) {
+  for (int id = 0; id < 15; id++) {
     if ((id == 6) && H * W * C % 4) {
       printf("Unaligned version, skipping 6\n");
       continue;
