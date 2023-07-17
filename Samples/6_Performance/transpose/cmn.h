@@ -39,6 +39,7 @@ struct SimpleSampleDesc {
   Out *__restrict__ out;
   const In *__restrict__ in;
   int H, W, C;
+  Roi<2> bounds;
   // didn't work
   //  TensorShape<3> shape;
 
@@ -46,6 +47,7 @@ struct SimpleSampleDesc {
   const float *__restrict__ norm_mul;
   const void *__restrict__ fill_values;
 
+  bool mirror;
 };
 
 template <int static_channels, typename Out, typename In>
@@ -508,10 +510,15 @@ __global__ void SortChannelsSharedPreloadFloatPrologueEpilogueMirror(const Simpl
   // idx is not divided by the static channels (mostly the block.start.x)
   for (int64_t idx = threadIdx.x + block.start.x / kStaticChannels, base_x = threadIdx.x;
     idx < block.end.x / kStaticChannels; idx += blockDim.x, base_x += blockDim.x) {
-    int y = idx / sample.W;
-    int x = idx - (int64_t)y * sample.W;
-    int target_x = sample.W - 1 - x;
-    int64_t out_offset = (int64_t)y * sample.W + target_x;
+    int64_t out_offset;
+    if (sample.mirror) {
+      int y = idx / sample.W;
+      int x = idx - (int64_t)y * sample.W;
+      int target_x = sample.W - 1 - x;
+      out_offset = (int64_t)y * sample.W + target_x;
+    } else {
+      out_offset = idx;
+    }
     #pragma unroll kStaticChannels
     for (int c = 0; c < kStaticChannels; c++) {
       float fpin = prologue_tile[base_x * sample.C + c];
@@ -1027,6 +1034,7 @@ void RunSN(int num_samples, input_t *input, output_t *output, float *norm_add, f
     // simple_sample_desc[i].shape = {H, W, C};
     simple_sample_desc[i].norm_add = norm_add + i * C;
     simple_sample_desc[i].norm_mul = norm_mul + i * C;
+    simple_sample_desc[i].mirror = false;
 
   }
 
