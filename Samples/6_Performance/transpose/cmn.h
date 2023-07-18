@@ -1684,7 +1684,6 @@ void RunSN(int num_samples, input_t *input, output_t *output, float *norm_add, f
   checkCudaErrors(cudaEventDestroy(stop));
   cudaFree(samples_gpu);
   cudaFree(tiles_gpu);
-
 }
 
 template <typename T>
@@ -1696,6 +1695,17 @@ void print_planes(T *data, int H, int W, int C) {
         printf("%.0f, ", static_cast<float>(data[c * H * W + y * W + x]));
       }
       printf("|||\n");
+    }
+  }
+}
+
+void prep_gold(float *out, const uint8_t *in, int oH, int oW, int C, int iH, int iW,
+               int Y = 0, int X = 0) {
+  for (int c = 0; c < C; c++) {
+    for (int y = 0; y < oH; y++) {
+      for (int x = 0; x < oW; x++) {
+        out[c * oH * oW + y * oW + x] = in[(y + Y) * iW * C + (x + X) * C + c];
+      }
     }
   }
 }
@@ -1724,11 +1734,7 @@ void prepare_and_run(int num_samples, int H, int W, int C) {
 
   std::vector<output_t> gold_cpu;
   gold_cpu.resize(H * W * C);
-  for (int c = 0; c < C; c++) {
-    for (int i = 0; i < H * W; i++) {
-      gold_cpu[c * H*W + i] = ConvertSat<float>((c + i * C) % 256);
-    }
-  }
+  prep_gold(gold_cpu.data(), input_cpu.data(), H, W, C, H, W);
 
   cudaMemcpy(input_gpu, input_cpu.data(), sizeof(input_t) * H * W * C, cudaMemcpyHostToDevice);
   for (int i = 1; i < num_samples; i++) {
@@ -1774,6 +1780,210 @@ void prepare_and_run(int num_samples, int H, int W, int C) {
   cudaStreamDestroy(stream);
 }
 
+
+
+
+void RunSN_Crop(int num_samples, input_t *input, output_t *output, float *norm_add, float *norm_mul, cudaStream_t stream,
+                int id, int H, int W, int C, int iH, int iW, int Y, int X) {
+  constexpr int spatial_ndim = 2;
+  constexpr int channel_dim = 2;
+  using Out = output_t;
+  using In = input_t;
+  using Tile = kernels::BlockDesc<spatial_ndim>;
+  using Sample = SampleDesc<Out, In, spatial_ndim>;
+  using CollapsedBlock = kernels::BlockDesc<1>;
+  using SimpleSample = SimpleSampleDesc<Out, In>;
+
+  std::vector<Sample> sample_descs;
+  sample_descs.resize(num_samples);
+
+  // This goes by x, y - inverted compared to the shape.
+  int64_t in_img_size = iH * iW * C;
+  int64_t out_img_size = H * W * C;
+
+
+  TensorListShape<3> shape = uniform_list_shape(num_samples, TensorShape<3>{H, W, C});
+  TensorListShape<1> collapsed_shape = collapse_dims<1>(shape, {{0, 3}});
+
+
+  std::vector<SimpleSample> simple_sample_desc(num_samples);
+  for (int i = 0; i < num_samples; i++) {
+    simple_sample_desc[i].in = input + i * in_img_size + Y * iW * C + X * C;
+    simple_sample_desc[i].out = output + i * out_img_size;
+    simple_sample_desc[i].H = H;
+    simple_sample_desc[i].W = W;
+    simple_sample_desc[i].C = C;
+    // doesn't work, I thought it would, but it does not
+    // simple_sample_desc[i].shape = {H, W, C};
+    simple_sample_desc[i].norm_add = norm_add + i * C;
+    simple_sample_desc[i].norm_mul = norm_mul + i * C;
+    simple_sample_desc[i].mirror = false;
+    simple_sample_desc[i].input_W = iW;
+
+  }
+
+
+
+  BlockSetup<1, -1> collapsed_block_setup(1); // why do I need to set this multiplier here? xDDDD
+  collapsed_block_setup.SetDefaultBlockSize({kBlockSizeMul * kBlockWidth});
+  collapsed_block_setup.SetBlockDim(dim3{128, 1, 1});
+  collapsed_block_setup.SetupBlocks(collapsed_shape, true);
+  auto collapsed_blocks_cpu = collapsed_block_setup.Blocks();
+  auto collapsed_grid_dim = collapsed_block_setup.GridDim();
+  auto collapsed_block_dim = collapsed_block_setup.BlockDim();
+
+
+  std::vector<BlockDesc<1>> collapsed_blocks_aligned_manual;
+  constexpr int kTileSize = kBlockSizeMul * kBlockWidth;
+  for (int sample_idx = 0; sample_idx < collapsed_shape.num_samples(); sample_idx++) {
+    int64_t len = collapsed_shape.tensor_shape(sample_idx)[0];
+    auto sample_base = reinterpret_cast<uintptr_t>(simple_sample_desc[sample_idx].in);
+    int start_alignment = sample_base % 4;  // TODO(sizeof(uint32_t))
+
+    // We can start at byte 0, 1, 2, 3, we want to move by the multiple of 3 channels to the
+    // 4-byte boundary, so we can move by, 0, 3, 6 or 9 respectively. and we
+    // add some kBlockWidth * 6 elements to do some processing in the first tile.
+    // All other tiles are divisible by 3 and 4, so they are both aligned with 4-byte boundary
+    // and with channels.
+    static_assert(kBlockWidth % 4 == 0, "Block is already a multiple of alignment");
+    int first_tile_from_alignment[4] = {0, 3 + kBlockWidth * 6, 6 + kBlockWidth * 6, 9 + kBlockWidth * 6};
+
+    // auto aligned_start = align_up(sample_base, kTileSize);
+    auto first_tile_size = first_tile_from_alignment[start_alignment];
+    BlockDesc<1> blk;
+    blk.sample_idx = sample_idx;
+    blk.start[0] = 0;
+    if (first_tile_size) {
+      blk.end[0] = first_tile_size;
+      collapsed_blocks_aligned_manual.push_back(blk);
+    }
+    for (int64_t start = first_tile_size; start < len; start += kTileSize) {
+      blk.start[0] = start;
+      blk.end[0] = std::min(start + kTileSize, len);
+      collapsed_blocks_aligned_manual.push_back(blk);
+    }
+  }
+
+  SimpleSample *simple_samples_gpu = nullptr;
+  CollapsedBlock *collapsed_blocks_gpu = nullptr;
+
+
+  cudaMalloc((void **)&simple_samples_gpu, num_samples * sizeof(SimpleSample));
+  cudaMemcpy(simple_samples_gpu, simple_sample_desc.data(), num_samples * sizeof(SimpleSample), cudaMemcpyHostToDevice);
+
+  constexpr bool USE_ALIGNMENT = false;
+  if (USE_ALIGNMENT) {
+    cudaMalloc((void **)&collapsed_blocks_gpu, collapsed_blocks_aligned_manual.size() * sizeof(CollapsedBlock));
+    cudaMemcpy(collapsed_blocks_gpu, collapsed_blocks_aligned_manual.data(), collapsed_blocks_aligned_manual.size() * sizeof(CollapsedBlock), cudaMemcpyHostToDevice);
+
+    // TODO DODODODODO: VERY IMPORTANT, ALIGN THE GRID:
+    collapsed_grid_dim = dim3(collapsed_blocks_aligned_manual.size(), 1, 1);
+
+  } else {
+
+    cudaMalloc((void **)&collapsed_blocks_gpu, collapsed_blocks_cpu.size() * sizeof(CollapsedBlock));
+    cudaMemcpy(collapsed_blocks_gpu, collapsed_blocks_cpu.data(), collapsed_blocks_cpu.size() * sizeof(CollapsedBlock), cudaMemcpyHostToDevice);
+  }
+  if (id == 0) {
+    SortChannelsSharedPreloadFloatPrologueEpilogueF32Crop<Out, In><<<collapsed_grid_dim, collapsed_block_dim, 0, stream>>>(simple_samples_gpu, collapsed_blocks_gpu);
+  }
+
+
+  // CUDA events
+  cudaEvent_t start, stop;
+  // initialize events
+  checkCudaErrors(cudaEventCreate(&start));
+  checkCudaErrors(cudaEventCreate(&stop));
+
+  cudaEventRecord(start, stream);
+
+  for (int i = 0; i < NUM_ITERS; i++) {
+    if (id == 0) {
+      SortChannelsSharedPreloadFloatPrologueEpilogueF32Crop<Out, In><<<collapsed_grid_dim, collapsed_block_dim, 0, stream>>>(simple_samples_gpu, collapsed_blocks_gpu);
+    }
+
+  }
+
+
+  checkCudaErrors(cudaEventRecord(stop, stream));
+  checkCudaErrors(cudaEventSynchronize(stop));
+  float kernelTime;
+  checkCudaErrors(cudaEventElapsedTime(&kernelTime, start, stop));
+
+      // report effective bandwidths
+  float kernelBandwidth = num_samples * 1000.0f * (H * W * C * (sizeof(uint8_t) + sizeof(float))) / (1024 * 1024 * 1024) /
+    (kernelTime / NUM_ITERS);
+  printf(
+  "CMN %d, Throughput = %.4f GB/s, Time = %.5f ms, Size = %d x %d x %d\n",
+  id, kernelBandwidth, kernelTime / NUM_ITERS, H, W, C);
+
+
+  checkCudaErrors(cudaEventDestroy(start));
+  checkCudaErrors(cudaEventDestroy(stop));
+}
+
+
+void prepare_and_run_crop(int num_samples, int H, int W, int C, int iH, int iW, int Y, int X) {
+  input_t *input_gpu;
+  output_t *output_gpu;
+  float *norm_add_gpu, *norm_mul_gpu;
+  cudaMalloc((void **)&input_gpu, num_samples * sizeof(input_t) * iH * iW * C);
+  cudaMalloc((void **)&output_gpu, num_samples * sizeof(output_t) * H * W * C);
+  cudaMalloc((void **)&norm_add_gpu, num_samples * sizeof(float) * C);
+  cudaMalloc((void **)&norm_mul_gpu, num_samples * sizeof(float) * C);
+
+  std::vector<float> norm_add(num_samples * C, 0.f), norm_mul(num_samples * C, 1.f);
+  cudaMemcpy(norm_add_gpu, norm_add.data(), num_samples * sizeof(float) * C, cudaMemcpyHostToDevice);
+  cudaMemcpy(norm_mul_gpu, norm_mul.data(), num_samples * sizeof(float) * C, cudaMemcpyHostToDevice);
+
+
+  // prepare input 0, 1, 2, 3, 4...
+  // prepare gold output 0,3,6.... 1,4,7,... 2,5,8,...
+  std::vector<input_t> input_cpu;
+  input_cpu.resize(iH * iW * C);
+  for (int i = 0; i < iH * iW * C; i++) {
+    input_cpu[i] = i;
+  }
+
+  std::vector<output_t> gold_cpu;
+  gold_cpu.resize(H * W * C);
+  prep_gold(gold_cpu.data(), input_cpu.data(), H, W, C, iH, iW, Y, X);
+
+  cudaMemcpy(input_gpu, input_cpu.data(), sizeof(input_t) * iH * iW * C, cudaMemcpyHostToDevice);
+  for (int i = 1; i < num_samples; i++) {
+    cudaMemcpy(input_gpu + i * iH * iW * C, input_gpu, sizeof(input_t) * iH * iW * C, cudaMemcpyDeviceToDevice);
+  }
+
+
+  std::vector<output_t> output_cpu;
+  output_cpu.resize(num_samples * H * W * C);
+
+
+  cudaStream_t stream;
+  cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking);
+  for (int id = 0; id < 1; id++) {
+    cudaMemset(output_gpu, 0, num_samples * sizeof(output_t) * H * W * C);
+    RunSN_Crop(num_samples, input_gpu, output_gpu, norm_add_gpu, norm_mul_gpu, stream, id, H, W, C, iH, iW, X, Y);
+
+    cudaMemcpy(output_cpu.data(), output_gpu, sizeof(output_t) * num_samples *  H * W * C, cudaMemcpyDeviceToHost);
+    for (int i = 0; i < num_samples; i++) {
+      bool res = compareData(gold_cpu.data(), output_cpu.data() + i * H * W * C, H * W * C, 0.01f, 0.0f);
+      // printf("Expected: %d, sample %d\n", id, i);
+      // print_planes(gold_cpu.data(), H, W, C);
+      // printf("\n\n=============================================================\nComputed: %d, sample %d\n", id, i);
+      // print_planes(output_cpu.data() + i * H * W * C, H, W, C);
+      if (res == false) {
+        printf("*** %s kernel FAILED ***\n", "CMN");
+      }
+    }
+  }
+
+  cudaFree(input_gpu);
+  cudaFree(output_gpu);
+  cudaFree(norm_add_gpu);
+  cudaFree(norm_mul_gpu);
+  cudaStreamDestroy(stream);
+}
 
 }
 }

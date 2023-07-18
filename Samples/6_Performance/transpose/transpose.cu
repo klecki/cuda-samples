@@ -806,6 +806,14 @@ int main(int argc, char **argv) {
 
   dali::kernels::prepare_and_run(64, 999, 999, 3);
 
+
+  dali::kernels::prepare_and_run_crop(64, 1024, 1024, 3, 2048, 2048, 512, 512);
+
+
+  dali::kernels::prepare_and_run_crop(64, 999, 999, 3, 999 * 2, 999 * 2, 513, 513);
+  // dali::kernels::prepare_and_run_crop(1, 63, 63, 3, 999 * 2, 999 * 2, 117, 192);
+
+
   checkCudaErrors(cudaEventDestroy(start));
   checkCudaErrors(cudaEventDestroy(stop));
 
