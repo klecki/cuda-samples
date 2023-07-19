@@ -8,6 +8,9 @@
 #include "dali/core/fast_div.h"
 #include "dali/core/convert.h"
 
+#include <cuda/pipeline>
+#include <cooperative_groups.h>
+
 // #include "dbg.h"
 
 namespace dali {
@@ -1238,6 +1241,140 @@ __global__ void SortChannelsSharedPreloadFloatPrologueEpilogueF32Crop(const Simp
 }
 
 
+
+template <typename Out, typename In>
+__global__ void SortChannelsSharedPreloadFloatPrologueEpilogueF32CropCooperative(const SimpleSampleDesc<Out, In> *samples,
+                             const BlockDesc<1> *blocks) {
+  const auto block = blocks[blockIdx.x];
+  const auto sample = samples[block.sample_idx];
+  __shared__ In tile[kBlockSizeMul * kBlockWidth + 33 * 4];
+
+  float norm_mul[kStaticChannels], norm_add[kStaticChannels];
+
+  #pragma unroll kStaticChannels
+  for (int c = 0; c < kStaticChannels; c++) {
+    norm_mul[c] = sample.norm_mul[c];
+    norm_add[c] = sample.norm_add[c];
+  }
+
+  // TODO: assumes u8
+
+  auto group = cooperative_groups::this_thread_block();
+  constexpr auto scope = cuda::thread_scope_block;
+  constexpr auto stages_count = 2;
+  __shared__ cuda::pipeline_shared_state<scope, stages_count> shared_state;
+  auto pipeline = cuda::make_pipeline(group, &shared_state);
+
+
+  // // calculate the "jump" to previous aligned
+  int in_stride = sample.input_W * sample.C;
+  int out_stride = sample.W * sample.C;
+
+
+  // left in row:
+  // int out_stride
+  // maybe it is actually easier to have a block loop
+  int y_start = block.start.x / out_stride;
+  int y_end = block.end.x / out_stride + 1;
+
+  int xc_start = block.start.x - y_start * out_stride;
+
+  In *tile_row = tile;
+
+  int elements_stage_0, elements_stage_1, total_consumed = 0;
+
+  pipeline.producer_acquire();
+
+  // lazy
+  for (int y = y_start; y < y_start + 1; y++) {
+    int xc_start, xc_end;
+
+    if (y == y_start) {
+      xc_start = block.start.x - y_start * out_stride;
+
+    } else {
+      xc_start = 0;
+    }
+
+    if (y == y_end - 1) {
+      xc_end = block.end.x - (y_end - 1) * out_stride;  // + 1? - nope
+    } else {
+      xc_end = out_stride;
+    }
+
+    const In *prologue_in = sample.in + y * in_stride + xc_start;
+
+    cuda::memcpy_async(group, tile_row, prologue_in, sizeof(In) * (xc_end - xc_start), pipeline);
+
+    tile_row += (xc_end - xc_start);
+    elements_stage_0 = (xc_end - xc_start);
+  }
+
+  pipeline.producer_commit();
+
+  for (int y = y_start + 1; y < y_end; y++) {
+
+    pipeline.producer_acquire();
+    int xc_start, xc_end;
+
+    if (y == y_start) {
+      xc_start = block.start.x - y_start * out_stride;
+
+    } else {
+      xc_start = 0;
+    }
+
+    if (y == y_end - 1) {
+      xc_end = block.end.x - (y_end - 1) * out_stride;  // + 1? - nope
+    } else {
+      xc_end = out_stride;
+    }
+
+    const In *prologue_in = sample.in + y * in_stride + xc_start;
+
+    cuda::memcpy_async(group, tile_row, prologue_in, sizeof(In) * (xc_end - xc_start), pipeline);
+
+    tile_row += (xc_end - xc_start);
+    elements_stage_1 = (xc_end - xc_start);
+
+    pipeline.producer_commit();
+
+    pipeline.consumer_wait();
+    for (int64_t idx = threadIdx.x + block.start.x / kStaticChannels + total_consumed, base_x = threadIdx.x;
+      base_x < elements_stage_0 / kStaticChannels; idx += blockDim.x, base_x += blockDim.x) {
+      #pragma unroll kStaticChannels
+      for (int c = 0; c < kStaticChannels; c++) {
+        float fpin = tile[base_x * sample.C + c];
+        float fpout = fmaf(fpin, norm_mul[c], norm_add[c]);
+        sample.out[c * sample.H * sample.W + idx] = ConvertSat<Out>(fpout);
+      }
+    }
+    total_consumed += (elements_stage_0 / kStaticChannels);
+    elements_stage_0 = elements_stage_1;
+    pipeline.consumer_release();
+  }
+
+
+  pipeline.consumer_wait();
+  for (int64_t idx = threadIdx.x + block.start.x / kStaticChannels + total_consumed, base_x = threadIdx.x;
+    idx < block.end.x / kStaticChannels; idx += blockDim.x, base_x += blockDim.x) {
+    #pragma unroll kStaticChannels
+    for (int c = 0; c < kStaticChannels; c++) {
+      float fpin = tile[base_x * sample.C + c];
+      float fpout = fmaf(fpin, norm_mul[c], norm_add[c]);
+      sample.out[c * sample.H * sample.W + idx] = ConvertSat<Out>(fpout);
+    }
+  }
+
+  pipeline.consumer_release();
+
+  // idx is not divided by the static channels (mostly the block.start.x)
+
+}
+
+
+
+
 // Worse
 template <typename Out, typename In>
 __global__ void SortChannelsSharedOut(const SimpleSampleDesc<Out, In> *samples,
@@ -1887,6 +2024,9 @@ void RunSN_Crop(int num_samples, input_t *input, output_t *output, float *norm_a
   if (id == 0) {
     SortChannelsSharedPreloadFloatPrologueEpilogueF32Crop<Out, In><<<collapsed_grid_dim, collapsed_block_dim, 0, stream>>>(simple_samples_gpu, collapsed_blocks_gpu);
   }
+  if (id == 1) {
+    SortChannelsSharedPreloadFloatPrologueEpilogueF32CropCooperative<<<collapsed_grid_dim, collapsed_block_dim, 0, stream>>>(simple_samples_gpu, collapsed_blocks_gpu);
+  }
 
 
   // CUDA events
@@ -1901,6 +2041,10 @@ void RunSN_Crop(int num_samples, input_t *input, output_t *output, float *norm_a
     if (id == 0) {
       SortChannelsSharedPreloadFloatPrologueEpilogueF32Crop<Out, In><<<collapsed_grid_dim, collapsed_block_dim, 0, stream>>>(simple_samples_gpu, collapsed_blocks_gpu);
     }
+    if (id == 1) {
+      SortChannelsSharedPreloadFloatPrologueEpilogueF32CropCooperative<<<collapsed_grid_dim, collapsed_block_dim, 0, stream>>>(simple_samples_gpu, collapsed_blocks_gpu);
+    }
+
 
   }
 
@@ -1961,7 +2105,7 @@ void prepare_and_run_crop(int num_samples, int H, int W, int C, int iH, int iW, 
 
   cudaStream_t stream;
   cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking);
-  for (int id = 0; id < 1; id++) {
+  for (int id = 0; id < 2; id++) {
     cudaMemset(output_gpu, 0, num_samples * sizeof(output_t) * H * W * C);
     RunSN_Crop(num_samples, input_gpu, output_gpu, norm_add_gpu, norm_mul_gpu, stream, id, H, W, C, iH, iW, X, Y);
 
