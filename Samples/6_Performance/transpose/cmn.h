@@ -1340,8 +1340,8 @@ __global__ void SortChannelsSharedPreloadFloatPrologueEpilogueF32CropCooperative
     pipeline.producer_commit();
 
     pipeline.consumer_wait();
-    for (int64_t idx = threadIdx.x + block.start.x / kStaticChannels + total_consumed, base_x = threadIdx.x;
-      base_x < elements_stage_0 / kStaticChannels; idx += blockDim.x, base_x += blockDim.x) {
+    for (int64_t idx = threadIdx.x + block.start.x / kStaticChannels + total_consumed, base_x = threadIdx.x + total_consumed;
+      base_x < total_consumed + elements_stage_0 / kStaticChannels; idx += blockDim.x, base_x += blockDim.x) {
       #pragma unroll kStaticChannels
       for (int c = 0; c < kStaticChannels; c++) {
         float fpin = tile[base_x * sample.C + c];
@@ -1356,7 +1356,7 @@ __global__ void SortChannelsSharedPreloadFloatPrologueEpilogueF32CropCooperative
 
 
   pipeline.consumer_wait();
-  for (int64_t idx = threadIdx.x + block.start.x / kStaticChannels + total_consumed, base_x = threadIdx.x;
+  for (int64_t idx = threadIdx.x + block.start.x / kStaticChannels + total_consumed, base_x = threadIdx.x + total_consumed;
     idx < block.end.x / kStaticChannels; idx += blockDim.x, base_x += blockDim.x) {
     #pragma unroll kStaticChannels
     for (int c = 0; c < kStaticChannels; c++) {
@@ -1899,13 +1899,13 @@ void prepare_and_run(int num_samples, int H, int W, int C) {
       continue;
     }
     for (int i = 0; i < num_samples; i++) {
-      bool res = compareData(gold_cpu.data(), output_cpu.data() + i * H * W * C, H * W * C, 0.01f, 0.0f);
+      auto res = compareData(gold_cpu.data(), output_cpu.data() + i * H * W * C, H * W * C, 0.01f, 0.0f);
       // printf("Expected: %d, sample %d\n", id, i);
       // print_planes(gold_cpu.data(), H, W, C);
       // printf("\n\n=============================================================\nComputed: %d, sample %d\n", id, i);
       // print_planes(output_cpu.data() + i * H * W * C, H, W, C);
-      if (res == false) {
-        printf("*** %s kernel FAILED ***\n", "CMN");
+      if (res) {
+        printf("*** %s kernel FAILED: %u ***\n", "CMN", res);
       }
     }
   }
@@ -2111,13 +2111,13 @@ void prepare_and_run_crop(int num_samples, int H, int W, int C, int iH, int iW, 
 
     cudaMemcpy(output_cpu.data(), output_gpu, sizeof(output_t) * num_samples *  H * W * C, cudaMemcpyDeviceToHost);
     for (int i = 0; i < num_samples; i++) {
-      bool res = compareData(gold_cpu.data(), output_cpu.data() + i * H * W * C, H * W * C, 0.01f, 0.0f);
+      auto res = compareData(gold_cpu.data(), output_cpu.data() + i * H * W * C, H * W * C, 0.01f, 0.0f);
       // printf("Expected: %d, sample %d\n", id, i);
       // print_planes(gold_cpu.data(), H, W, C);
       // printf("\n\n=============================================================\nComputed: %d, sample %d\n", id, i);
       // print_planes(output_cpu.data() + i * H * W * C, H, W, C);
-      if (res == false) {
-        printf("*** %s kernel FAILED ***\n", "CMN");
+      if (res) {
+        printf("*** %s kernel FAILED: %u ***\n", "CMN", res);
       }
     }
   }

@@ -515,7 +515,7 @@ inline bool sdkWriteFile(const char *filename, const T *data, unsigned int len,
 //! @param epsilon    epsilon to use for the comparison
 //////////////////////////////////////////////////////////////////////////////
 template <class T, class S, class U=T>
-inline bool compareData(const T *reference, const U *data,
+inline unsigned int compareData(const T *reference, const U *data,
                         const unsigned int len, const S epsilon,
                         const float threshold) {
   assert(epsilon >= 0);
@@ -550,17 +550,18 @@ inline bool compareData(const T *reference, const U *data,
 #endif
   }
 
-  if (threshold == 0.0f) {
-    return (result) ? true : false;
-  } else {
-    if (error_count) {
-      printf("%4.2f(%%) of bytes mismatched (count=%d)\n",
-             static_cast<float>(error_count) * 100 / static_cast<float>(len),
-             error_count);
-    }
+  return error_count;
+  // if (threshold == 0.0f) {
+  //   return (result) ? true : false;
+  // } else {
+  //   if (error_count) {
+  //     printf("%4.2f(%%) of bytes mismatched (count=%d)\n",
+  //            static_cast<float>(error_count) * 100 / static_cast<float>(len),
+  //            error_count);
+  //   }
 
-    return (len * threshold > error_count) ? true : false;
-  }
+  //   return (len * threshold > error_count) ? true : false;
+  // }
 }
 
 #ifndef __MIN_EPSILON_ERROR
