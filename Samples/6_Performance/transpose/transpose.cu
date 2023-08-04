@@ -806,7 +806,8 @@ int main(int argc, char **argv) {
   dali::kernels::prepare_and_run(samples, 1024, 1024, 3, 3);
 
 
-  dali::kernels::prepare_and_run(samples, 999, 999, 3, 3);
+  // dali::kernels::prepare_and_run(samples, 999, 999, 3, 3);
+  dali::kernels::prepare_and_run(samples, 1024, 1024, 3, 4, 12, 18);
 
   // std::cout << "Crop no op 1024x1024 -> 1024x1024"  << std::endl;
   // dali::kernels::prepare_and_run_crop(samples, 1024, 1024, 3, 1024, 1024, 0, 0);
