@@ -41,21 +41,38 @@ template <typename Out, typename In>
 struct SimpleSampleDesc {
   Out *__restrict__ out;
   const In *__restrict__ in;
-  int H, W, C;
-
   const float *__restrict__ norm_add;
   const float *__restrict__ norm_mul;
   const void *__restrict__ fill_values;
+
+  int64_t sample_size;
+  uint32_t first_block;
+
+  int H, W, C;
+  int input_W, input_C;
+
 
   // TODO(klecki): This is specifically less generic to save on compute and memsize:
   // We support only cropping in X, as cropping in Y can be done on tile level.
   // cropping channels is even weirder, but we can easily support it by adjusting the
   // second loop range (the one writing output).
 
-  int input_W;
 
   bool mirror;
 };
+
+
+
+
+inline __device__ uint32_t FindSampleIdx(uint32_t *first_blocks,
+                                         uint32_t num_samples) {
+  uint32_t i = 0;
+  for (uint32_t jump = (1 << (32 - __clz(num_samples) - 1)); jump; jump >>= 1) {
+    if (i + jump < num_samples && first_blocks[i + jump] <= blockIdx.x)
+      i += jump;
+  }
+  return i;
+}
 
 template <int static_channels, typename Out, typename In>
 __device__ void SliceNormalizeKernel_2D_NoPad_Ch(const SampleDesc<Out, In, 2> &sample,
@@ -182,415 +199,17 @@ __global__ void SortChannelsSharedIn(const SimpleSampleDesc<Out, In> *samples,
 
 
 template <typename Out, typename In>
-__global__ void SortChannelsSharedPreload(const SimpleSampleDesc<Out, In> *samples,
-                             const BlockDesc<1> *blocks) {
-  const auto block = blocks[blockIdx.x];
-  const auto sample = samples[block.sample_idx];
-  float norm_mul[kStaticChannels], norm_add[kStaticChannels];
+__global__ void SortChannelsSharedPreloadFloatPrologueEpilogueF32HWC2CHW(const SimpleSampleDesc<Out, In> *samples, uint32_t *first_blocks,
+                             uint32_t num_samples) {
 
-  #pragma unroll kStaticChannels
-  for (int c = 0; c < kStaticChannels; c++) {
-    norm_mul[c] = sample.norm_mul[c];
-    norm_add[c] = sample.norm_add[c];
-  }
-  __shared__ In tile[kBlockSizeMul * kBlockWidth];
-  int y_stride = sample.W * sample.C;  // TODO: make channels always 3?
-  for (int64_t idx = threadIdx.x + block.start.x, base_x = threadIdx.x; idx < block.end.x; idx += blockDim.x, base_x += blockDim.x) {
-    // todo fast_div
-    // int c = idx % sample.C;
-    tile[base_x] = sample.in[idx];
-  }
-  __syncthreads();
+  static constexpr int kBlockSize = kBlockWidth * kBlockSizeMul;
+  int sample_idx = FindSampleIdx(first_blocks, num_samples);
+  const auto sample = samples[sample_idx];
 
-  // idx is not divided by the static channels (mostly the block.start.x)
-  for (int64_t idx = threadIdx.x + block.start.x / kStaticChannels, base_x = threadIdx.x;
-    idx < block.end.x / kStaticChannels; idx += blockDim.x, base_x += blockDim.x) {
-    #pragma unroll kStaticChannels
-    for (int c = 0; c < kStaticChannels; c++) {
-      float fpin = tile[base_x * sample.C + c];
-      float fpout = fmaf(fpin, norm_mul[c], norm_add[c]);
-      sample.out[c * sample.H * sample.W + idx] = ConvertSat<Out>(fpout);
-    }
-  }
-}
+  int64_t start_x = (blockIdx.x - sample.first_block) * kBlockSize;
+  int64_t end_x = ::min(start_x + kBlockSize, sample.sample_size);
 
-// Works only on aligned data!!!
-template <typename Out, typename In>
-__global__ void SortChannelsSharedPreloadFloat(const SimpleSampleDesc<Out, In> *samples,
-                             const BlockDesc<1> *blocks) {
-  const auto block = blocks[blockIdx.x];
-  const auto sample = samples[block.sample_idx];
-  float norm_mul[kStaticChannels], norm_add[kStaticChannels];
 
-  #pragma unroll kStaticChannels
-  for (int c = 0; c < kStaticChannels; c++) {
-    norm_mul[c] = sample.norm_mul[c];
-    norm_add[c] = sample.norm_add[c];
-  }
-  __shared__ In tile[kBlockSizeMul * kBlockWidth];
-  int y_stride = sample.W * sample.C;  // TODO: make channels always 3?
-  uint32_t *tmp = reinterpret_cast<uint32_t*>(tile);
-  const uint32_t *in = reinterpret_cast<const uint32_t*>(sample.in);
-  for (int64_t idx = threadIdx.x + block.start.x / 4, base_x = threadIdx.x; idx < block.end.x / 4; idx += blockDim.x, base_x += blockDim.x) {
-    // todo fast_div
-    // int c = idx % sample.C;
-    // tile[base_x] = sample.in[idx];
-    tmp[base_x] = in[idx];
-  }
-  __syncthreads();
-
-  // idx is not divided by the static channels (mostly the block.start.x)
-  for (int64_t idx = threadIdx.x + block.start.x / kStaticChannels, base_x = threadIdx.x;
-    idx < block.end.x / kStaticChannels; idx += blockDim.x, base_x += blockDim.x) {
-    #pragma unroll kStaticChannels
-    for (int c = 0; c < kStaticChannels; c++) {
-      float fpin = tile[base_x * sample.C + c];
-      float fpout = fmaf(fpin, norm_mul[c], norm_add[c]);
-      sample.out[c * sample.H * sample.W + idx] = ConvertSat<Out>(fpout);
-    }
-  }
-}
-
-template <typename Out, typename In>
-__global__ void SortChannelsSharedPreloadFloatCond(const SimpleSampleDesc<Out, In> *samples,
-                             const BlockDesc<1> *blocks) {
-  const auto block = blocks[blockIdx.x];
-  const auto sample = samples[block.sample_idx];
-  float norm_mul[kStaticChannels], norm_add[kStaticChannels];
-
-  #pragma unroll kStaticChannels
-  for (int c = 0; c < kStaticChannels; c++) {
-    norm_mul[c] = sample.norm_mul[c];
-    norm_add[c] = sample.norm_add[c];
-  }
-  __shared__ In tile[kBlockSizeMul * kBlockWidth];
-  int y_stride = sample.W * sample.C;  // TODO: make channels always 3?
-  if ((reinterpret_cast<std::uintptr_t>(sample.in + block.start.x)) % 4 == 0) {
-    uint32_t *tmp = reinterpret_cast<uint32_t*>(tile);
-    const uint32_t *in = reinterpret_cast<const uint32_t*>(sample.in + block.start.x);
-    for (int64_t idx = threadIdx.x + block.start.x / 4, base_x = threadIdx.x; idx < block.end.x / 4; idx += blockDim.x, base_x += blockDim.x) {
-      // todo fast_div
-      // int c = idx % sample.C;
-      // tile[base_x] = sample.in[idx];
-      tmp[base_x] = in[base_x];
-    }
-
-    int iters = (block.end.x / 4 - block.start.x / 4) / blockDim.x;
-    // In case we are not divisible by 4, we need to process up to last 3 elements
-    // loop iters - we can count them, or have a counter, check which is faster
-    // TODO(klecki): Introduce alignment and padding, at least on the per-sample basis.
-
-    int64_t last_read = (block.end.x / 4) * 4 - 1;
-    int64_t last_written = last_read - block.start.x;
-
-    for (int64_t idx = threadIdx.x + last_read, base_x = threadIdx.x + last_written; idx < block.end.x; idx += blockDim.x, base_x += blockDim.x) {
-      // todo fast_div
-      // int c = idx % sample.C;
-      tile[base_x] = sample.in[idx];
-    }
-
-  } else {
-    for (int64_t idx = threadIdx.x + block.start.x, base_x = threadIdx.x; idx < block.end.x; idx += blockDim.x, base_x += blockDim.x) {
-      // todo fast_div
-      // int c = idx % sample.C;
-      tile[base_x] = sample.in[idx];
-    }
-  }
-  __syncthreads();
-
-  // idx is not divided by the static channels (mostly the block.start.x)
-  for (int64_t idx = threadIdx.x + block.start.x / kStaticChannels, base_x = threadIdx.x;
-    idx < block.end.x / kStaticChannels; idx += blockDim.x, base_x += blockDim.x) {
-    #pragma unroll kStaticChannels
-    for (int c = 0; c < kStaticChannels; c++) {
-      float fpin = tile[base_x * sample.C + c];
-      float fpout = fmaf(fpin, norm_mul[c], norm_add[c]);
-      sample.out[c * sample.H * sample.W + idx] = ConvertSat<Out>(fpout);
-    }
-  }
-}
-
-
-
-//  THIS VERSION SKIPS THE TAIL DATA LOAD DUE TO PADDING ISSUE TO MEASURE THE PERF IMPACT
-template <typename Out, typename In>
-__global__ void SortChannelsSharedPreloadFloatCondWrong(const SimpleSampleDesc<Out, In> *samples,
-                             const BlockDesc<1> *blocks) {
-  const auto block = blocks[blockIdx.x];
-  const auto sample = samples[block.sample_idx];
-  float norm_mul[kStaticChannels], norm_add[kStaticChannels];
-
-  #pragma unroll kStaticChannels
-  for (int c = 0; c < kStaticChannels; c++) {
-    norm_mul[c] = sample.norm_mul[c];
-    norm_add[c] = sample.norm_add[c];
-  }
-  __shared__ In tile[kBlockSizeMul * kBlockWidth];
-  int y_stride = sample.W * sample.C;  // TODO: make channels always 3?
-  if ((reinterpret_cast<std::uintptr_t>(sample.in + block.start.x)) % 4 == 0) {
-    uint32_t *tmp = reinterpret_cast<uint32_t*>(tile);
-    const uint32_t *in = reinterpret_cast<const uint32_t*>(sample.in + block.start.x);
-    for (int64_t idx = threadIdx.x + block.start.x / 4, base_x = threadIdx.x; idx < block.end.x / 4; idx += blockDim.x, base_x += blockDim.x) {
-      // todo fast_div
-      // int c = idx % sample.C;
-      // tile[base_x] = sample.in[idx];
-      tmp[base_x] = in[base_x];
-    }
-
-    //  THIS PART IS COMMENTED OUT TO MEASURE THEORETICAL PERF IMPACT
-    // int64_t last_read = (block.end.x / 4) * 4 - 1;
-    // int64_t last_written = last_read - block.start.x;
-
-    // for (int64_t idx = threadIdx.x + last_read, base_x = threadIdx.x + last_written; idx < block.end.x; idx += blockDim.x, base_x += blockDim.x) {
-    //   // todo fast_div
-    //   // int c = idx % sample.C;
-    //   tile[base_x] = sample.in[idx];
-    // }
-
-  } else {
-    for (int64_t idx = threadIdx.x + block.start.x, base_x = threadIdx.x; idx < block.end.x; idx += blockDim.x, base_x += blockDim.x) {
-      // todo fast_div
-      // int c = idx % sample.C;
-      tile[base_x] = sample.in[idx];
-    }
-  }
-  __syncthreads();
-
-  // idx is not divided by the static channels (mostly the block.start.x)
-  for (int64_t idx = threadIdx.x + block.start.x / kStaticChannels, base_x = threadIdx.x;
-    idx < block.end.x / kStaticChannels; idx += blockDim.x, base_x += blockDim.x) {
-    #pragma unroll kStaticChannels
-    for (int c = 0; c < kStaticChannels; c++) {
-      float fpin = tile[base_x * sample.C + c];
-      float fpout = fmaf(fpin, norm_mul[c], norm_add[c]);
-      sample.out[c * sample.H * sample.W + idx] = ConvertSat<Out>(fpout);
-    }
-  }
-}
-
-
-template <typename Out, typename In>
-__global__ void SortChannelsSharedPreloadFloatPrologueEpilogue(const SimpleSampleDesc<Out, In> *samples,
-                             const BlockDesc<1> *blocks) {
-  const auto block = blocks[blockIdx.x];
-  const auto sample = samples[block.sample_idx];
-  __shared__ In tile[kBlockSizeMul * kBlockWidth + 33 * 4];
-
-  float norm_mul[kStaticChannels], norm_add[kStaticChannels];
-  // int H = sample.H, W = sample.W, C = sample.C;
-  // const In* in = sample.in;
-  // Out *out = sample.out;
-
-  #pragma unroll kStaticChannels
-  for (int c = 0; c < kStaticChannels; c++) {
-    norm_mul[c] = sample.norm_mul[c];
-    norm_add[c] = sample.norm_add[c];
-  }
-
-
-  // TODO: assumes u8
-
-  auto in_start = reinterpret_cast<std::uintptr_t>(sample.in + block.start.x);
-  auto aligned_in_start = align_up(in_start, 32 * 4);
-  auto bytes_skipped = aligned_in_start - in_start;
-
-  In *aligned_tile = tile + 32 * 4;
-  In *prologue_tile = aligned_tile - bytes_skipped;
-  const In *prologue_in = sample.in + block.start.x;
-
-
-  uint32_t *aligned_tile_u32 = reinterpret_cast<uint32_t*>(aligned_tile);
-  const uint32_t *aligned_in_u32 = reinterpret_cast<const uint32_t*>(sample.in + block.start.x + bytes_skipped);
-
-  // prologue
-  for (int64_t idx = threadIdx.x; idx < bytes_skipped; idx += blockDim.x) {
-    prologue_tile[idx] = prologue_in[idx];
-  }
-
-  int64_t left_after_prologue = block.end.x - block.start.x - bytes_skipped;
-
-  // aligned load
-  for (int64_t idx = threadIdx.x; idx < left_after_prologue / 4; idx += blockDim.x) {
-    aligned_tile_u32[idx] = aligned_in_u32[idx];
-  }
-
-  // epilogue
-  In *epilogue_tile = reinterpret_cast<In*>(aligned_tile_u32 + left_after_prologue / 4);
-  const In *epilogue_in = reinterpret_cast<const In*>(aligned_in_u32 + left_after_prologue / 4);
-
-  int64_t left_after_main = left_after_prologue - (left_after_prologue /  4) * 4;
-  for (int64_t idx = threadIdx.x; idx < left_after_main; idx++) {
-    epilogue_tile[idx] = epilogue_in[idx];
-  }
-
-  __syncthreads();
-
-  // idx is not divided by the static channels (mostly the block.start.x)
-  for (int64_t idx = threadIdx.x + block.start.x / kStaticChannels, base_x = threadIdx.x;
-    idx < block.end.x / kStaticChannels; idx += blockDim.x, base_x += blockDim.x) {
-    #pragma unroll kStaticChannels
-    for (int c = 0; c < kStaticChannels; c++) {
-      float fpin = prologue_tile[base_x * sample.C + c];
-      float fpout = fmaf(fpin, norm_mul[c], norm_add[c]);
-      // printf("%f %f\n", fpout, fpout);
-      sample.out[c * sample.H * sample.W + idx] = ConvertSat<Out>(fpout);
-    }
-  }
-}
-
-template <typename Out, typename In>
-__global__ void SortChannelsSharedPreloadFloatShortPrologueEpilogue(const SimpleSampleDesc<Out, In> *samples,
-                             const BlockDesc<1> *blocks) {
-  const auto block = blocks[blockIdx.x];
-  const auto sample = samples[block.sample_idx];
-  __shared__ In tile[kBlockSizeMul * kBlockWidth + 32 * 4];
-
-  float norm_mul[kStaticChannels], norm_add[kStaticChannels];
-  // int H = sample.H, W = sample.W, C = sample.C;
-  // const In* in = sample.in;
-  // Out *out = sample.out;
-
-  #pragma unroll kStaticChannels
-  for (int c = 0; c < kStaticChannels; c++) {
-    norm_mul[c] = sample.norm_mul[c];
-    norm_add[c] = sample.norm_add[c];
-  }
-
-
-  // TODO: assumes u8
-
-  auto in_start = reinterpret_cast<std::uintptr_t>(sample.in + block.start.x);
-  auto aligned_in_start = align_up(in_start, 4);
-  auto bytes_skipped = aligned_in_start - in_start;
-
-  In *aligned_tile = tile + 4;
-  In *prologue_tile = aligned_tile - bytes_skipped;
-  const In *prologue_in = sample.in + block.start.x;
-
-
-  uint32_t *aligned_tile_u32 = reinterpret_cast<uint32_t*>(aligned_tile);
-  const uint32_t *aligned_in_u32 = reinterpret_cast<const uint32_t*>(sample.in + block.start.x + bytes_skipped);
-
-  // prologue
-  for (int64_t idx = threadIdx.x; idx < bytes_skipped; idx += blockDim.x) {
-    prologue_tile[idx] = prologue_in[idx];
-  }
-
-  int64_t left_after_prologue = block.end.x - block.start.x - bytes_skipped;
-
-  // aligned load
-  for (int64_t idx = threadIdx.x; idx < left_after_prologue / 4; idx += blockDim.x) {
-    aligned_tile_u32[idx] = aligned_in_u32[idx];
-  }
-
-  // epilogue
-  In *epilogue_tile = reinterpret_cast<In*>(aligned_tile_u32 + left_after_prologue / 4);
-  const In *epilogue_in = reinterpret_cast<const In*>(aligned_in_u32 + left_after_prologue / 4);
-
-  int64_t left_after_main = left_after_prologue - (left_after_prologue /  4) * 4;
-  for (int64_t idx = threadIdx.x; idx < left_after_main; idx++) {
-    epilogue_tile[idx] = epilogue_in[idx];
-  }
-
-  __syncthreads();
-
-  // idx is not divided by the static channels (mostly the block.start.x)
-  for (int64_t idx = threadIdx.x + block.start.x / kStaticChannels, base_x = threadIdx.x;
-    idx < block.end.x / kStaticChannels; idx += blockDim.x, base_x += blockDim.x) {
-    #pragma unroll kStaticChannels
-    for (int c = 0; c < kStaticChannels; c++) {
-      float fpin = prologue_tile[base_x * sample.C + c];
-      float fpout = fmaf(fpin, norm_mul[c], norm_add[c]);
-      // printf("%f %f\n", fpout, fpout);
-      sample.out[c * sample.H * sample.W + idx] = ConvertSat<Out>(fpout);
-    }
-  }
-}
-
-// PERF IS SIMILAR, TODO, ADD A TEST
-template <typename Out, typename In>
-__global__ void SortChannelsSharedPreloadFloatPrologueEpilogueMirror(const SimpleSampleDesc<Out, In> *samples,
-                             const BlockDesc<1> *blocks) {
-  const auto block = blocks[blockIdx.x];
-  const auto sample = samples[block.sample_idx];
-  __shared__ In tile[kBlockSizeMul * kBlockWidth + 33 * 4];
-
-  float norm_mul[kStaticChannels], norm_add[kStaticChannels];
-  // int H = sample.H, W = sample.W, C = sample.C;
-  // const In* in = sample.in;
-  // Out *out = sample.out;
-
-  #pragma unroll kStaticChannels
-  for (int c = 0; c < kStaticChannels; c++) {
-    norm_mul[c] = sample.norm_mul[c];
-    norm_add[c] = sample.norm_add[c];
-  }
-
-  // TODO: assumes u8
-
-  auto in_start = reinterpret_cast<std::uintptr_t>(sample.in + block.start.x);
-  auto aligned_in_start = align_up(in_start, 32 * 4);
-  auto bytes_skipped = aligned_in_start - in_start;
-
-  In *aligned_tile = tile + 32 * 4;
-  In *prologue_tile = aligned_tile - bytes_skipped;
-  const In *prologue_in = sample.in + block.start.x;
-
-
-  uint32_t *aligned_tile_u32 = reinterpret_cast<uint32_t*>(aligned_tile);
-  const uint32_t *aligned_in_u32 = reinterpret_cast<const uint32_t*>(sample.in + block.start.x + bytes_skipped);
-
-  // prologue
-  for (int64_t idx = threadIdx.x; idx < bytes_skipped; idx += blockDim.x) {
-    prologue_tile[idx] = prologue_in[idx];
-  }
-
-  int64_t left_after_prologue = block.end.x - block.start.x - bytes_skipped;
-
-  // aligned load
-  for (int64_t idx = threadIdx.x; idx < left_after_prologue / 4; idx += blockDim.x) {
-    aligned_tile_u32[idx] = aligned_in_u32[idx];
-  }
-
-  // epilogue
-  In *epilogue_tile = reinterpret_cast<In*>(aligned_tile_u32 + left_after_prologue / 4);
-  const In *epilogue_in = reinterpret_cast<const In*>(aligned_in_u32 + left_after_prologue / 4);
-
-  int64_t left_after_main = left_after_prologue - (left_after_prologue /  4) * 4;
-  for (int64_t idx = threadIdx.x; idx < left_after_main; idx++) {
-    epilogue_tile[idx] = epilogue_in[idx];
-  }
-
-  __syncthreads();
-
-  // idx is not divided by the static channels (mostly the block.start.x)
-  for (int64_t idx = threadIdx.x + block.start.x / kStaticChannels, base_x = threadIdx.x;
-    idx < block.end.x / kStaticChannels; idx += blockDim.x, base_x += blockDim.x) {
-    int64_t out_offset;
-    if (sample.mirror) {
-      int y = idx / sample.W;
-      int x = idx - (int64_t)y * sample.W;
-      int target_x = sample.W - 1 - x;
-      out_offset = (int64_t)y * sample.W + target_x;
-    } else {
-      out_offset = idx;
-    }
-    #pragma unroll kStaticChannels
-    for (int c = 0; c < kStaticChannels; c++) {
-      float fpin = prologue_tile[base_x * sample.C + c];
-      float fpout = fmaf(fpin, norm_mul[c], norm_add[c]);
-      // printf("%f %f\n", fpout, fpout);
-      sample.out[c * sample.H * sample.W + out_offset] = ConvertSat<Out>(fpout);
-    }
-  }
-}
-
-
-template <typename Out, typename In>
-__global__ void SortChannelsSharedPreloadFloatPrologueEpilogueF32(const SimpleSampleDesc<Out, In> *samples,
-                             const BlockDesc<1> *blocks) {
-  const auto block = blocks[blockIdx.x];
-  const auto sample = samples[block.sample_idx];
   __shared__ float tile[kBlockSizeMul * kBlockWidth + 33 * 4];
 
   float norm_mul[kStaticChannels], norm_add[kStaticChannels];
@@ -603,24 +222,24 @@ __global__ void SortChannelsSharedPreloadFloatPrologueEpilogueF32(const SimpleSa
 
   // TODO: assumes u8
 
-  auto in_start = reinterpret_cast<std::uintptr_t>(sample.in + block.start.x);
+  auto in_start = reinterpret_cast<std::uintptr_t>(sample.in + start_x);
   auto aligned_in_start = align_up(in_start, 32*4);
   auto bytes_skipped = aligned_in_start - in_start;
 
   float *aligned_tile = tile + 32 * 4;
   float *prologue_tile = aligned_tile - bytes_skipped;
-  const In *prologue_in = sample.in + block.start.x;
+  const In *prologue_in = sample.in + start_x;
 
 
   // float *aligned_tile_u32 = reinterpret_cast<uint32_t*>(aligned_tile);
-  const uchar4 *aligned_in_char4 = reinterpret_cast<const uchar4*>(sample.in + block.start.x + bytes_skipped);
+  const uchar4 *aligned_in_char4 = reinterpret_cast<const uchar4*>(sample.in + start_x + bytes_skipped);
 
   // prologue
   for (int64_t idx = threadIdx.x; idx < bytes_skipped; idx += blockDim.x) {
     prologue_tile[idx] = prologue_in[idx];
   }
 
-  int64_t left_after_prologue = block.end.x - block.start.x - bytes_skipped;
+  int64_t left_after_prologue = end_x - start_x - bytes_skipped;
 
   // aligned load
   for (int64_t idx = threadIdx.x; idx < left_after_prologue / 4; idx += blockDim.x) {
@@ -643,10 +262,8 @@ __global__ void SortChannelsSharedPreloadFloatPrologueEpilogueF32(const SimpleSa
   }
 
   __syncthreads();
-
-  // idx is not divided by the static channels (mostly the block.start.x)
-  for (int64_t idx = threadIdx.x + block.start.x / kStaticChannels, base_x = threadIdx.x;
-    idx < block.end.x / kStaticChannels; idx += blockDim.x, base_x += blockDim.x) {
+  for (int64_t idx = threadIdx.x + start_x / kStaticChannels, base_x = threadIdx.x;
+    idx < end_x / kStaticChannels; idx += blockDim.x, base_x += blockDim.x) {
     #pragma unroll kStaticChannels
     for (int c = 0; c < kStaticChannels; c++) {
       float fpin = prologue_tile[base_x * sample.C + c];
@@ -654,15 +271,33 @@ __global__ void SortChannelsSharedPreloadFloatPrologueEpilogueF32(const SimpleSa
       sample.out[c * sample.H * sample.W + idx] = ConvertSat<Out>(fpout);
     }
   }
+
+  // // idx is not divided by the static channels (mostly the start_x)
+  // for (int64_t idx = threadIdx.x + start_x, base_x = threadIdx.x;
+  //   idx < end_x; idx += blockDim.x, base_x += blockDim.x) {
+
+  //   fast_div<uint32_t> channel(kStaticChannels);
+  //   int c = idx % channel;
+  //   float fpin = prologue_tile[base_x];
+  //   float fpout = fmaf(fpin, norm_mul[c], norm_add[c]);
+  //   sample.out[idx] = ConvertSat<Out>(fpout);
+  // }
 }
 
 
 
 template <typename Out, typename In>
-__global__ void SortChannelsSharedPreloadFloatPrologueEpilogueF32Mirror(const SimpleSampleDesc<Out, In> *samples,
-                             const BlockDesc<1> *blocks) {
-  const auto block = blocks[blockIdx.x];
-  const auto sample = samples[block.sample_idx];
+__global__ void SortChannelsSharedPreloadFloatPrologueEpilogueF32(const SimpleSampleDesc<Out, In> *samples, uint32_t *first_blocks,
+                             uint32_t num_samples) {
+
+  static constexpr int kBlockSize = kBlockWidth * kBlockSizeMul;
+  int sample_idx = FindSampleIdx(first_blocks, num_samples);
+  const auto sample = samples[sample_idx];
+
+  int64_t start_x = (blockIdx.x - sample.first_block) * kBlockSize;
+  int64_t end_x = ::min(start_x + kBlockSize, sample.sample_size);
+
+
   __shared__ float tile[kBlockSizeMul * kBlockWidth + 33 * 4];
 
   float norm_mul[kStaticChannels], norm_add[kStaticChannels];
@@ -675,24 +310,24 @@ __global__ void SortChannelsSharedPreloadFloatPrologueEpilogueF32Mirror(const Si
 
   // TODO: assumes u8
 
-  auto in_start = reinterpret_cast<std::uintptr_t>(sample.in + block.start.x);
+  auto in_start = reinterpret_cast<std::uintptr_t>(sample.in + start_x);
   auto aligned_in_start = align_up(in_start, 32*4);
   auto bytes_skipped = aligned_in_start - in_start;
 
   float *aligned_tile = tile + 32 * 4;
   float *prologue_tile = aligned_tile - bytes_skipped;
-  const In *prologue_in = sample.in + block.start.x;
+  const In *prologue_in = sample.in + start_x;
 
 
   // float *aligned_tile_u32 = reinterpret_cast<uint32_t*>(aligned_tile);
-  const uchar4 *aligned_in_char4 = reinterpret_cast<const uchar4*>(sample.in + block.start.x + bytes_skipped);
+  const uchar4 *aligned_in_char4 = reinterpret_cast<const uchar4*>(sample.in + start_x + bytes_skipped);
 
   // prologue
   for (int64_t idx = threadIdx.x; idx < bytes_skipped; idx += blockDim.x) {
     prologue_tile[idx] = prologue_in[idx];
   }
 
-  int64_t left_after_prologue = block.end.x - block.start.x - bytes_skipped;
+  int64_t left_after_prologue = end_x - start_x - bytes_skipped;
 
   // aligned load
   for (int64_t idx = threadIdx.x; idx < left_after_prologue / 4; idx += blockDim.x) {
@@ -715,210 +350,70 @@ __global__ void SortChannelsSharedPreloadFloatPrologueEpilogueF32Mirror(const Si
   }
 
   __syncthreads();
-
-  // idx is not divided by the static channels (mostly the block.start.x)
-  for (int64_t idx = threadIdx.x + block.start.x / kStaticChannels, base_x = threadIdx.x;
-    idx < block.end.x / kStaticChannels; idx += blockDim.x, base_x += blockDim.x) {
-    int64_t out_offset;
-    if (sample.mirror) {
-      int y = idx / sample.W;
-      int x = idx - (int64_t)y * sample.W;
-      int target_x = sample.W - 1 - x;
-      out_offset = (int64_t)y * sample.W + target_x;
-    } else {
-      out_offset = idx;
-    }
-    #pragma unroll kStaticChannels
-    for (int c = 0; c < kStaticChannels; c++) {
-      float fpin = prologue_tile[base_x * sample.C + c];
-      float fpout = fmaf(fpin, norm_mul[c], norm_add[c]);
-      sample.out[c * sample.H * sample.W + out_offset] = ConvertSat<Out>(fpout);
-    }
-  }
-}
-
-
-template <typename Out, typename In>
-__global__ void SortChannelsSharedPreloadFloatShortPrologueEpilogueF32(const SimpleSampleDesc<Out, In> *samples,
-                             const BlockDesc<1> *blocks) {
-  const auto block = blocks[blockIdx.x];
-  const auto sample = samples[block.sample_idx];
-  __shared__ float tile[kBlockSizeMul * kBlockWidth + 32 * 4];
-
-  float norm_mul[kStaticChannels], norm_add[kStaticChannels];
-
-  #pragma unroll kStaticChannels
-  for (int c = 0; c < kStaticChannels; c++) {
-    norm_mul[c] = sample.norm_mul[c];
-    norm_add[c] = sample.norm_add[c];
-  }
-
-  // TODO: assumes u8
-
-  auto in_start = reinterpret_cast<std::uintptr_t>(sample.in + block.start.x);
-  auto aligned_in_start = align_up(in_start, 4);
-  auto bytes_skipped = aligned_in_start - in_start;
-
-  float *aligned_tile = tile + 4;
-  float *prologue_tile = aligned_tile - bytes_skipped;
-  const In *prologue_in = sample.in + block.start.x;
-
-
-  // float *aligned_tile_u32 = reinterpret_cast<uint32_t*>(aligned_tile);
-  const uchar4 *aligned_in_char4 = reinterpret_cast<const uchar4*>(sample.in + block.start.x + bytes_skipped);
-
-  // prologue
-  for (int64_t idx = threadIdx.x; idx < bytes_skipped; idx += blockDim.x) {
-    prologue_tile[idx] = prologue_in[idx];
-  }
-
-  int64_t left_after_prologue = block.end.x - block.start.x - bytes_skipped;
-
-  // aligned load
-  for (int64_t idx = threadIdx.x; idx < left_after_prologue / 4; idx += blockDim.x) {
-    uchar4 in = aligned_in_char4[idx];
-    aligned_tile[idx * 4 + 0] = in.x;
-    aligned_tile[idx * 4 + 1] = in.y;
-    aligned_tile[idx * 4 + 2] = in.z;
-    aligned_tile[idx * 4 + 3] = in.w;
-  }
-
-  int64_t processed_in_main = (left_after_prologue /  4) * 4;
-  int64_t left_after_main = left_after_prologue - processed_in_main;
-
-  // epilogue
-  float *epilogue_tile = aligned_tile + processed_in_main;
-  const In *epilogue_in = reinterpret_cast<const In*>(aligned_in_char4 + processed_in_main / 4);
-
-  for (int64_t idx = threadIdx.x; idx < left_after_main; idx++) {
-    epilogue_tile[idx] = epilogue_in[idx];
-  }
-
-  __syncthreads();
-
-  // idx is not divided by the static channels (mostly the block.start.x)
-  for (int64_t idx = threadIdx.x + block.start.x / kStaticChannels, base_x = threadIdx.x;
-    idx < block.end.x / kStaticChannels; idx += blockDim.x, base_x += blockDim.x) {
-    #pragma unroll kStaticChannels
-    for (int c = 0; c < kStaticChannels; c++) {
-      float fpin = prologue_tile[base_x * sample.C + c];
-      float fpout = fmaf(fpin, norm_mul[c], norm_add[c]);
-      sample.out[c * sample.H * sample.W + idx] = ConvertSat<Out>(fpout);
-    }
-  }
-}
-
-template <typename Out, typename In>
-__global__ void SortChannelsSharedPreloadFloatPrologueEpilogueF32JustRead(const SimpleSampleDesc<Out, In> *samples,
-                             const BlockDesc<1> *blocks) {
-  const auto block = blocks[blockIdx.x];
-  const auto sample = samples[block.sample_idx];
-  float norm_mul[kStaticChannels], norm_add[kStaticChannels];
-
-  #pragma unroll kStaticChannels
-  for (int c = 0; c < kStaticChannels; c++) {
-    norm_mul[c] = sample.norm_mul[c];
-    norm_add[c] = sample.norm_add[c];
-  }
-  __shared__ float tile[kBlockSizeMul * kBlockWidth + 33 * 4];
-
-  // TODO: assumes u8
-
-  auto in_start = reinterpret_cast<std::uintptr_t>(sample.in + block.start.x);
-  auto aligned_in_start = align_up(in_start, 32*4);
-  auto bytes_skipped = aligned_in_start - in_start;
-
-  float *aligned_tile = tile + 32 * 4;
-  float *prologue_tile = aligned_tile - bytes_skipped;
-  const In *prologue_in = sample.in + block.start.x;
-
-
-  // float *aligned_tile_u32 = reinterpret_cast<uint32_t*>(aligned_tile);
-  const uchar4 *aligned_in_char4 = reinterpret_cast<const uchar4*>(sample.in + block.start.x + bytes_skipped);
-
-  // prologue
-  for (int64_t idx = threadIdx.x; idx < bytes_skipped; idx += blockDim.x) {
-    prologue_tile[idx] = prologue_in[idx];
-  }
-
-  int64_t left_after_prologue = block.end.x - block.start.x - bytes_skipped;
-
-  // aligned load
-  for (int64_t idx = threadIdx.x; idx < left_after_prologue / 4; idx += blockDim.x) {
-    uchar4 in = aligned_in_char4[idx];
-    aligned_tile[idx * 4 + 0] = in.x;
-    aligned_tile[idx * 4 + 1] = in.y;
-    aligned_tile[idx * 4 + 2] = in.z;
-    aligned_tile[idx * 4 + 3] = in.w;
-  }
-
-  int64_t processed_in_main = (left_after_prologue /  4) * 4;
-  int64_t left_after_main = left_after_prologue - processed_in_main;
-
-  // epilogue
-  float *epilogue_tile = aligned_tile + processed_in_main;
-  const In *epilogue_in = reinterpret_cast<const In*>(aligned_in_char4 + processed_in_main / 4);
-
-  for (int64_t idx = threadIdx.x; idx < left_after_main; idx++) {
-    epilogue_tile[idx] = epilogue_in[idx];
-  }
-
-  __syncthreads();
-  int64_t out_offset = block.start.x / kStaticChannels;
-  for (int64_t idx = threadIdx.x; idx < block.end.x - block.start.x; idx += blockDim.x) {
-    int64_t plane_offset = idx / kStaticChannels;
-    int c = idx - plane_offset * kStaticChannels;
-    float fpin = prologue_tile[idx];
-    float fpout = fmaf(fpin, norm_mul[c], norm_add[c]);
-    sample.out[c * sample.H * sample.W + plane_offset + out_offset] = ConvertSat<Out>(fpout);
-  }
-
-  // // idx is not divided by the static channels (mostly the block.start.x)
-  // for (int64_t idx = threadIdx.x + block.start.x / kStaticChannels, base_x = threadIdx.x;
-  //   idx < block.end.x / kStaticChannels; idx += blockDim.x, base_x += blockDim.x) {
+  // for (int64_t idx = threadIdx.x + start_x / kStaticChannels, base_x = threadIdx.x;
+  //   idx < end_x / kStaticChannels; idx += blockDim.x, base_x += blockDim.x) {
   //   #pragma unroll kStaticChannels
   //   for (int c = 0; c < kStaticChannels; c++) {
   //     float fpin = prologue_tile[base_x * sample.C + c];
   //     float fpout = fmaf(fpin, norm_mul[c], norm_add[c]);
-  //     sample.out[c * sample.H * sample.W + idx] = ConvertSat<Out>(fpout);
+  //     sample.out[idx * sample.C + c] = ConvertSat<Out>(fpout);
   //   }
   // }
+
+  // idx is not divided by the static channels (mostly the start_x)
+  for (int64_t idx = threadIdx.x + start_x, base_x = threadIdx.x;
+    idx < end_x; idx += blockDim.x, base_x += blockDim.x) {
+
+    fast_div<uint32_t> channel(kStaticChannels);
+    int c = idx % channel;
+    float fpin = prologue_tile[base_x];
+    float fpout = fmaf(fpin, norm_mul[c], norm_add[c]);
+    sample.out[idx] = ConvertSat<Out>(fpout);
+  }
 }
 
+
 template <typename Out, typename In>
-__global__ void SortChannelsSharedPreloadFloatPrologueEpilogueF32Align(const SimpleSampleDesc<Out, In> *samples,
-                             const BlockDesc<1> *blocks) {
-  const auto block = blocks[blockIdx.x];
-  const auto sample = samples[block.sample_idx];
+__global__ void SortChannelsSharedPreloadFloatPrologueEpilogueU8(const SimpleSampleDesc<Out, In> *samples, uint32_t *first_blocks,
+                             uint32_t num_samples) {
+
+  static constexpr int kBlockSize = kBlockWidth * kBlockSizeMul;
+  int sample_idx = FindSampleIdx(first_blocks, num_samples);
+  const auto sample = samples[sample_idx];
+
+  int64_t start_x = (blockIdx.x - sample.first_block) * kBlockSize;
+  int64_t end_x = ::min(start_x + kBlockSize, sample.sample_size);
+
   float norm_mul[kStaticChannels], norm_add[kStaticChannels];
+
+  __shared__ uint8_t tile[kBlockSizeMul * kBlockWidth + 33 * 4];
 
   #pragma unroll kStaticChannels
   for (int c = 0; c < kStaticChannels; c++) {
     norm_mul[c] = sample.norm_mul[c];
     norm_add[c] = sample.norm_add[c];
   }
-  __shared__ float tile[kBlockSizeMul * kBlockWidth + 33 * 4];
 
   // TODO: assumes u8
 
-  auto in_start = reinterpret_cast<std::uintptr_t>(sample.in + block.start.x);
+  auto in_start = reinterpret_cast<std::uintptr_t>(sample.in + start_x);
   auto aligned_in_start = align_up(in_start, 32*4);
   auto bytes_skipped = aligned_in_start - in_start;
 
-  float *aligned_tile = tile + 32 * 4;
-  float *prologue_tile = aligned_tile - bytes_skipped;
-  const In *prologue_in = sample.in + block.start.x;
+  uint8_t *aligned_tile = tile + 32 * 4;
+  uint8_t *prologue_tile = aligned_tile - bytes_skipped;
+  const In *prologue_in = sample.in + start_x;
 
 
   // float *aligned_tile_u32 = reinterpret_cast<uint32_t*>(aligned_tile);
-  const uchar4 *aligned_in_char4 = reinterpret_cast<const uchar4*>(sample.in + block.start.x + bytes_skipped);
+  const uchar4 *aligned_in_char4 = reinterpret_cast<const uchar4*>(sample.in + start_x + bytes_skipped);
 
   // prologue
   for (int64_t idx = threadIdx.x; idx < bytes_skipped; idx += blockDim.x) {
     prologue_tile[idx] = prologue_in[idx];
   }
 
-  int64_t left_after_prologue = block.end.x - block.start.x - bytes_skipped;
+  int64_t left_after_prologue = end_x - start_x - bytes_skipped;
 
   // aligned load
   for (int64_t idx = threadIdx.x; idx < left_after_prologue / 4; idx += blockDim.x) {
@@ -933,7 +428,7 @@ __global__ void SortChannelsSharedPreloadFloatPrologueEpilogueF32Align(const Sim
   int64_t left_after_main = left_after_prologue - processed_in_main;
 
   // epilogue
-  float *epilogue_tile = aligned_tile + processed_in_main;
+  uint8_t *epilogue_tile = aligned_tile + processed_in_main;
   const In *epilogue_in = reinterpret_cast<const In*>(aligned_in_char4 + processed_in_main / 4);
 
   for (int64_t idx = threadIdx.x; idx < left_after_main; idx++) {
@@ -941,174 +436,27 @@ __global__ void SortChannelsSharedPreloadFloatPrologueEpilogueF32Align(const Sim
   }
 
   __syncthreads();
+  // for (int64_t idx = threadIdx.x + start_x / kStaticChannels, base_x = threadIdx.x;
+  //   idx < end_x / kStaticChannels; idx += blockDim.x, base_x += blockDim.x) {
+  //   #pragma unroll kStaticChannels
+  //   for (int c = 0; c < kStaticChannels; c++) {
+  //     float fpin = prologue_tile[base_x * sample.C + c];
+  //     float fpout = fmaf(fpin, norm_mul[c], norm_add[c]);
+  //     sample.out[idx * sample.C + c] = ConvertSat<Out>(fpout);
+  //   }
+  // }
 
-  // get the first smem aligned to the 32 * 4, that is offset from start by multiple of 3.
-  // hmm, do we need it? the banks wrap around, and it is already in fp32.
+  // idx is not divided by the static channels (mostly the start_x)
+  for (int64_t idx = threadIdx.x + start_x, base_x = threadIdx.x;
+    idx < end_x; idx += blockDim.x, base_x += blockDim.x) {
 
-  int64_t out_offset = block.start.x / kStaticChannels;
-  for (int64_t idx = threadIdx.x; idx < (block.end.x - block.start.x); idx += kStaticChannels * blockDim.x) {
-    float fpin[kStaticChannels];
-    #pragma unroll kStaticChannels
-    for (int i = 0; i < kStaticChannels; i++) {
-      int64_t source_offset = idx + i * blockDim.x;
-      fpin[i] = prologue_tile[source_offset];
-      int64_t plane_offset = source_offset  / kStaticChannels;
-      int c = source_offset - plane_offset * kStaticChannels;
-      float fpout = fmaf(fpin[i], norm_mul[c], norm_add[c]);
-      sample.out[c * sample.H * sample.W + plane_offset + out_offset] = ConvertSat<Out>(fpout);
-    }
+    fast_div<uint32_t> channel(kStaticChannels);
+    int c = idx % channel;
+    float fpin = prologue_tile[base_x];
+    float fpout = fmaf(fpin, norm_mul[c], norm_add[c]);
+    sample.out[idx] = ConvertSat<Out>(fpout);
   }
 }
-
-template <typename Out, typename In>
-__global__ void SortChannelsSharedPreloadFloatPrologueEpilogueF32Align2(const SimpleSampleDesc<Out, In> *samples,
-                             const BlockDesc<1> *blocks) {
-  const auto block = blocks[blockIdx.x];
-  const auto sample = samples[block.sample_idx];
-  float norm_mul[kStaticChannels], norm_add[kStaticChannels];
-
-  #pragma unroll kStaticChannels
-  for (int c = 0; c < kStaticChannels; c++) {
-    norm_mul[c] = sample.norm_mul[c];
-    norm_add[c] = sample.norm_add[c];
-  }
-  __shared__ float tile[kBlockSizeMul * kBlockWidth + 33 * 4];
-
-  // TODO: assumes u8
-
-  auto in_start = reinterpret_cast<std::uintptr_t>(sample.in + block.start.x);
-  auto aligned_in_start = align_up(in_start, 32*4);
-  auto bytes_skipped = aligned_in_start - in_start;
-
-  float *aligned_tile = tile + 32 * 4;
-  float *prologue_tile = aligned_tile - bytes_skipped;
-  const In *prologue_in = sample.in + block.start.x;
-
-
-  // float *aligned_tile_u32 = reinterpret_cast<uint32_t*>(aligned_tile);
-  const uchar4 *aligned_in_char4 = reinterpret_cast<const uchar4*>(sample.in + block.start.x + bytes_skipped);
-
-  // prologue
-  for (int64_t idx = threadIdx.x; idx < bytes_skipped; idx += blockDim.x) {
-    prologue_tile[idx] = prologue_in[idx];
-  }
-
-  int64_t left_after_prologue = block.end.x - block.start.x - bytes_skipped;
-
-  // aligned load
-  for (int64_t idx = threadIdx.x; idx < left_after_prologue / 4; idx += blockDim.x) {
-    uchar4 in = aligned_in_char4[idx];
-    aligned_tile[idx * 4 + 0] = in.x;
-    aligned_tile[idx * 4 + 1] = in.y;
-    aligned_tile[idx * 4 + 2] = in.z;
-    aligned_tile[idx * 4 + 3] = in.w;
-  }
-
-  int64_t processed_in_main = (left_after_prologue /  4) * 4;
-  int64_t left_after_main = left_after_prologue - processed_in_main;
-
-  // epilogue
-  float *epilogue_tile = aligned_tile + processed_in_main;
-  const In *epilogue_in = reinterpret_cast<const In*>(aligned_in_char4 + processed_in_main / 4);
-
-  for (int64_t idx = threadIdx.x; idx < left_after_main; idx++) {
-    epilogue_tile[idx] = epilogue_in[idx];
-  }
-
-  __syncthreads();
-
-  // get the first smem aligned to the 32 * 4, that is offset from start by multiple of 3.
-  // hmm, do we need it? the banks wrap around, and it is already in fp32.
-
-  int64_t out_offset = block.start.x / kStaticChannels;
-  for (int64_t idx = threadIdx.x; idx < (block.end.x - block.start.x); idx += kStaticChannels * blockDim.x) {
-    float fpin[kStaticChannels];
-    #pragma unroll kStaticChannels
-    for (int i = 0; i < kStaticChannels; i++) {
-      fpin[i] = prologue_tile[idx + i * blockDim.x];
-    }
-    #pragma unroll kStaticChannels
-    for (int i = 0; i < kStaticChannels; i++) {
-      int64_t source_offset = idx + i * blockDim.x;
-      int64_t plane_offset = source_offset / kStaticChannels;
-      int c = source_offset - plane_offset * kStaticChannels;
-      float fpout = fmaf(fpin[i], norm_mul[c], norm_add[c]);
-      sample.out[c * sample.H * sample.W + plane_offset + out_offset] = ConvertSat<Out>(fpout);
-    }
-  }
-}
-
-
-
-template <typename Out, typename In>
-__global__ void SortChannelsSharedPreloadFloatPrologueEpilogueF32_U2(const SimpleSampleDesc<Out, In> *samples,
-                             const BlockDesc<1> *blocks) {
-  const auto block = blocks[blockIdx.x];
-  const auto sample = samples[block.sample_idx];
-  __shared__ float tile[kBlockSizeMul * kBlockWidth + 33 * 4];
-
-  float norm_mul[kStaticChannels], norm_add[kStaticChannels];
-
-  #pragma unroll kStaticChannels
-  for (int c = 0; c < kStaticChannels; c++) {
-    norm_mul[c] = sample.norm_mul[c];
-    norm_add[c] = sample.norm_add[c];
-  }
-
-  // TODO: assumes u8
-
-  auto in_start = reinterpret_cast<std::uintptr_t>(sample.in + block.start.x);
-  auto aligned_in_start = align_up(in_start, 32*4);
-  auto bytes_skipped = aligned_in_start - in_start;
-
-  float *aligned_tile = tile + 32 * 4;
-  float *prologue_tile = aligned_tile - bytes_skipped;
-  const In *prologue_in = sample.in + block.start.x;
-
-
-  // float *aligned_tile_u32 = reinterpret_cast<uint32_t*>(aligned_tile);
-  const uchar2 *aligned_in_char2 = reinterpret_cast<const uchar2*>(sample.in + block.start.x + bytes_skipped);
-
-  // prologue
-  for (int64_t idx = threadIdx.x; idx < bytes_skipped; idx += blockDim.x) {
-    prologue_tile[idx] = prologue_in[idx];
-  }
-
-  int64_t left_after_prologue = block.end.x - block.start.x - bytes_skipped;
-
-  // aligned load
-  for (int64_t idx = threadIdx.x; idx < left_after_prologue / 2; idx += blockDim.x) {
-    uchar2 in = aligned_in_char2[idx];
-    aligned_tile[idx * 2 + 0] = in.x;
-    aligned_tile[idx * 2 + 1] = in.y;
-  }
-
-  int64_t processed_in_main = (left_after_prologue /  2) * 2;
-  int64_t left_after_main = left_after_prologue - processed_in_main;
-
-  // epilogue
-  float *epilogue_tile = aligned_tile + processed_in_main;
-  const In *epilogue_in = reinterpret_cast<const In*>(aligned_in_char2 + processed_in_main / 2);
-
-  for (int64_t idx = threadIdx.x; idx < left_after_main; idx++) {
-    epilogue_tile[idx] = epilogue_in[idx];
-  }
-
-  __syncthreads();
-
-  // idx is not divided by the static channels (mostly the block.start.x)
-  for (int64_t idx = threadIdx.x + block.start.x / kStaticChannels, base_x = threadIdx.x;
-    idx < block.end.x / kStaticChannels; idx += blockDim.x, base_x += blockDim.x) {
-    #pragma unroll kStaticChannels
-    for (int c = 0; c < kStaticChannels; c++) {
-      float fpin = prologue_tile[base_x * sample.C + c];
-      float fpout = fmaf(fpin, norm_mul[c], norm_add[c]);
-      sample.out[c * sample.H * sample.W + idx] = ConvertSat<Out>(fpout);
-    }
-  }
-}
-
-
 
 
 template <typename Out, typename In>
@@ -1505,7 +853,7 @@ static constexpr int /*H = 999, W = 999, C = 3, */ NUM_ITERS = 100;
 using input_t = uint8_t;
 using output_t = float;
 
-void RunSN(int num_samples, input_t *input, output_t *output, float *norm_add, float *norm_mul, cudaStream_t stream, int id, int H, int W, int C) {
+void RunSN(int num_samples, input_t *input, output_t *output, float *norm_add, float *norm_mul, cudaStream_t stream, int id, int H, int W, int C, int oC) {
   constexpr int spatial_ndim = 2;
   constexpr int channel_dim = 2;
   using Out = output_t;
@@ -1525,8 +873,8 @@ void RunSN(int num_samples, input_t *input, output_t *output, float *norm_add, f
   int img_size = H * W * C;
 
 
-  vec<spatial_ndim, int32_t> out_size = {W, H};
-  vec<spatial_ndim, int64_t> out_stride = {1, W}; // HMMM, WTH
+  vec<spatial_ndim, int32_t> out_size = in_size; //{W, H};
+  vec<spatial_ndim, int64_t> out_stride = {oC, W * oC}; // {1, W}; // HMMM, WTH
   int out_ch_stride = H * W;
 
   // Roi<2> bounds = {ivec{0, 0}, out_size};
@@ -1537,7 +885,7 @@ void RunSN(int num_samples, input_t *input, output_t *output, float *norm_add, f
 
   for (int i = 0; i < num_samples; i++) {
     sample_descs[i].in = {input + i * img_size, in_size, C, in_stride, in_ch_stride};
-    sample_descs[i].out = {output + i * img_size, out_size, C, out_stride, out_ch_stride};
+    sample_descs[i].out = {output + i * img_size, out_size, C, out_stride, in_ch_stride};
     // sample_descs[i].bounds = bounds;
     sample_descs[i].norm_add = norm_add + i * C;
     sample_descs[i].norm_mul = norm_mul + i * C;
@@ -1545,19 +893,39 @@ void RunSN(int num_samples, input_t *input, output_t *output, float *norm_add, f
 
   }
 
+
+  uint32_t offset_blk = 0;
+  int nonempty_samples = 0;
+
   std::vector<SimpleSample> simple_sample_desc(num_samples);
+  std::vector<uint32_t> first_blocks(num_samples);
   for (int i = 0; i < num_samples; i++) {
-    simple_sample_desc[i].in = input + i * img_size;
-    simple_sample_desc[i].out = output + i * img_size;
-    simple_sample_desc[i].H = H;
-    simple_sample_desc[i].W = W;
-    simple_sample_desc[i].C = C;
+    int64_t sample_size = collapsed_shape[i][0];
+
+    if (sample_size == 0) {
+      continue;
+    }
+
+    auto &sample_desc = simple_sample_desc[nonempty_samples++];
+
+    sample_desc.first_block = offset_blk;
+    first_blocks[nonempty_samples - 1] = offset_blk;
+    sample_desc.sample_size = sample_size;
+    offset_blk += div_ceil(sample_size, kBlockSizeMul * kBlockWidth);
+
+
+    sample_desc.in = input + i * img_size;
+    sample_desc.out = output + i * img_size;
+    sample_desc.H = H;
+    sample_desc.W = W;
+    sample_desc.C = oC;
+    sample_desc.input_W = W;
+    sample_desc.input_C = C;
     // doesn't work, I thought it would, but it does not
     // simple_sample_desc[i].shape = {H, W, C};
-    simple_sample_desc[i].norm_add = norm_add + i * C;
-    simple_sample_desc[i].norm_mul = norm_mul + i * C;
-    simple_sample_desc[i].mirror = false;
-    simple_sample_desc[i].input_W = W;
+    sample_desc.norm_add = norm_add + i * C;
+    sample_desc.norm_mul = norm_mul + i * C;
+    sample_desc.mirror = false;
 
   }
 
@@ -1630,11 +998,14 @@ void RunSN(int num_samples, input_t *input, output_t *output, float *norm_add, f
 
   Sample *samples_gpu = nullptr;
   Tile *tiles_gpu = nullptr;
+  uint32_t *first_blocks_gpu = nullptr;
 
   cudaMalloc((void **)&samples_gpu, num_samples * sizeof(Sample));
   cudaMalloc((void **)&tiles_gpu, tiles_cpu.size() * sizeof(Tile));
+  cudaMalloc((void **)&first_blocks_gpu, num_samples * sizeof(uint32_t));
   cudaMemcpy(samples_gpu, sample_descs.data(), num_samples * sizeof(Sample), cudaMemcpyHostToDevice);
   cudaMemcpy(tiles_gpu, tiles_cpu.data(), tiles_cpu.size() * sizeof(Tile), cudaMemcpyHostToDevice);
+  cudaMemcpy(first_blocks_gpu, first_blocks.data(), num_samples * sizeof(uint32_t), cudaMemcpyHostToDevice);
 
 
   SimpleSample *simple_samples_gpu = nullptr;
@@ -1663,73 +1034,21 @@ void RunSN(int num_samples, input_t *input, output_t *output, float *norm_add, f
   //       collapsed_grid_dim.x, collapsed_grid_dim.y, collapsed_grid_dim.z,
   //       collapsed_block_dim.x, collapsed_block_dim.y, collapsed_block_dim.z);
 
-  if (id == 0) {
+  if (id == 8) {
+    SortChannelsSharedPreloadFloatPrologueEpilogueF32HWC2CHW<Out, In><<<offset_blk, 128, 0, stream>>>(simple_samples_gpu, first_blocks_gpu, nonempty_samples);
+  }
+
+  if (id == 9) {
     SliceNormalizeKernel_2D_NoPad<Out, In>
           <<<grid_dim, block_dim, 0, stream>>>(samples_gpu, tiles_gpu);
   }
-  // if (id == 1)
-  //   SortChannels<Out, In><<<collapsed_grid_dim, collapsed_block_dim, 0, stream>>>(simple_samples_gpu, collapsed_blocks_gpu);
-  // if (id == 2)
-  //   // SortChannelsFastDiv<Out, In><<<collapsed_grid_dim, collapsed_block_dim, 0, stream>>>(simple_samples_gpu, collapsed_blocks_gpu);
-  if (id == 1) {
-    SortChannelsSharedIn<Out, In><<<collapsed_grid_dim, collapsed_block_dim, 0, stream>>>(simple_samples_gpu, collapsed_blocks_gpu);
-  }
-  if (id == 2) {
-    SortChannelsSharedOut<Out, In><<<collapsed_grid_dim, collapsed_block_dim, 0, stream>>>(simple_samples_gpu, collapsed_blocks_gpu);
-  }
-  if (id == 3) {
-    SortChannelsInPlace0<Out, In><<<collapsed_grid_dim, collapsed_block_dim, 0, stream>>>(simple_samples_gpu, collapsed_blocks_gpu);
-  }
-  if (id == 4) {
-    SortChannelsInPlace1<Out, In><<<collapsed_grid_dim, collapsed_block_dim, 0, stream>>>(simple_samples_gpu, collapsed_blocks_gpu);
-  }
-  if (id == 5) {
-    SortChannelsSharedPreload<Out, In><<<collapsed_grid_dim, collapsed_block_dim, 0, stream>>>(simple_samples_gpu, collapsed_blocks_gpu);
-  }
-  if (id == 6) {
-    SortChannelsSharedPreloadFloat<Out, In><<<collapsed_grid_dim, collapsed_block_dim, 0, stream>>>(simple_samples_gpu, collapsed_blocks_gpu);
-  }
-  if (id == 7) {
-    SortChannelsSharedPreloadFloatCond<Out, In><<<collapsed_grid_dim, collapsed_block_dim, 0, stream>>>(simple_samples_gpu, collapsed_blocks_gpu);
-  }
-  if (id == 8) {
-    SortChannelsSharedPreloadFloatCondWrong<Out, In><<<collapsed_grid_dim, collapsed_block_dim, 0, stream>>>(simple_samples_gpu, collapsed_blocks_gpu);
-  }
-  if (id == 9) {
-    SortChannelsSharedPreloadFloatPrologueEpilogue<Out, In><<<collapsed_grid_dim, collapsed_block_dim, 0, stream>>>(simple_samples_gpu, collapsed_blocks_gpu);
-  }
   if (id == 10) {
-    SortChannelsSharedPreloadFloatPrologueEpilogueF32<Out, In><<<collapsed_grid_dim, collapsed_block_dim, 0, stream>>>(simple_samples_gpu, collapsed_blocks_gpu);
+    SortChannelsSharedPreloadFloatPrologueEpilogueF32<Out, In><<<offset_blk, 128, 0, stream>>>(simple_samples_gpu, first_blocks_gpu, nonempty_samples);
   }
   if (id == 11) {
-    SortChannelsSharedPreloadFloatPrologueEpilogueF32JustRead<Out, In><<<collapsed_grid_dim, collapsed_block_dim, 0, stream>>>(simple_samples_gpu, collapsed_blocks_gpu);
-  }
-  if (id == 12) {
-    SortChannelsSharedPreloadFloatPrologueEpilogueMirror<Out, In><<<collapsed_grid_dim, collapsed_block_dim, 0, stream>>>(simple_samples_gpu, collapsed_blocks_gpu);
-  }
-  if (id == 13) {
-    SortChannelsSharedPreloadFloatShortPrologueEpilogue<Out, In><<<collapsed_grid_dim, collapsed_block_dim, 0, stream>>>(simple_samples_gpu, collapsed_blocks_gpu);
-  }
-  if (id == 14) {
-    SortChannelsSharedPreloadFloatShortPrologueEpilogueF32<Out, In><<<collapsed_grid_dim, collapsed_block_dim, 0, stream>>>(simple_samples_gpu, collapsed_blocks_gpu);
-  }
-  if (id == 15) {
-    SortChannelsSharedPreloadFloatPrologueEpilogueF32Mirror<Out, In><<<collapsed_grid_dim, collapsed_block_dim, 0, stream>>>(simple_samples_gpu, collapsed_blocks_gpu);
-  }
-  if (id == 16) {
-    SortChannelsSharedPreloadFloatPrologueEpilogueF32_U2<Out, In><<<collapsed_grid_dim, collapsed_block_dim, 0, stream>>>(simple_samples_gpu, collapsed_blocks_gpu);
-  }
-  if (id == 17) {
-    SortChannelsSharedPreloadFloatPrologueEpilogueF32Crop<Out, In><<<collapsed_grid_dim, collapsed_block_dim, 0, stream>>>(simple_samples_gpu, collapsed_blocks_gpu);
+    SortChannelsSharedPreloadFloatPrologueEpilogueU8<Out, In><<<offset_blk, 128, 0, stream>>>(simple_samples_gpu, first_blocks_gpu, nonempty_samples);
   }
 
-  // those do not work any better
-  // if (id == 12) {
-  //   SortChannelsSharedPreloadFloatPrologueEpilogueF32Align<Out, In><<<collapsed_grid_dim, collapsed_block_dim, 0, stream>>>(simple_samples_gpu, collapsed_blocks_gpu);
-  // }
-  // if (id == 13) {
-  //   SortChannelsSharedPreloadFloatPrologueEpilogueF32Align2<Out, In><<<collapsed_grid_dim, collapsed_block_dim, 0, stream>>>(simple_samples_gpu, collapsed_blocks_gpu);
-  // }
 
 
   // CUDA events
@@ -1741,64 +1060,20 @@ void RunSN(int num_samples, input_t *input, output_t *output, float *norm_add, f
   cudaEventRecord(start, stream);
 
   for (int i = 0; i < NUM_ITERS; i++) {
-    if (id == 0) {
+
+    if (id == 8) {
+      SortChannelsSharedPreloadFloatPrologueEpilogueF32HWC2CHW<Out, In><<<offset_blk, 128, 0, stream>>>(simple_samples_gpu, first_blocks_gpu, nonempty_samples);
+    }
+
+    if (id == 9) {
       SliceNormalizeKernel_2D_NoPad<Out, In>
             <<<grid_dim, block_dim, 0, stream>>>(samples_gpu, tiles_gpu);
     }
-    // if (id == 1)
-    //   SortChannels<Out, In><<<collapsed_grid_dim, collapsed_block_dim, 0, stream>>>(simple_samples_gpu, collapsed_blocks_gpu);
-    // if (id == 2)
-    //   // SortChannelsFastDiv<Out, In><<<collapsed_grid_dim, collapsed_block_dim, 0, stream>>>(simple_samples_gpu, collapsed_blocks_gpu);
-    if (id == 1) {
-      SortChannelsSharedIn<Out, In><<<collapsed_grid_dim, collapsed_block_dim, 0, stream>>>(simple_samples_gpu, collapsed_blocks_gpu);
-    }
-    if (id == 2) {
-      SortChannelsSharedOut<Out, In><<<collapsed_grid_dim, collapsed_block_dim, 0, stream>>>(simple_samples_gpu, collapsed_blocks_gpu);
-    }
-    if (id == 3) {
-      SortChannelsInPlace0<Out, In><<<collapsed_grid_dim, collapsed_block_dim, 0, stream>>>(simple_samples_gpu, collapsed_blocks_gpu);
-    }
-    if (id == 4) {
-      SortChannelsInPlace1<Out, In><<<collapsed_grid_dim, collapsed_block_dim, 0, stream>>>(simple_samples_gpu, collapsed_blocks_gpu);
-    }
-    if (id == 5) {
-      SortChannelsSharedPreload<Out, In><<<collapsed_grid_dim, collapsed_block_dim, 0, stream>>>(simple_samples_gpu, collapsed_blocks_gpu);
-    }
-    if (id == 6) {
-      SortChannelsSharedPreloadFloat<Out, In><<<collapsed_grid_dim, collapsed_block_dim, 0, stream>>>(simple_samples_gpu, collapsed_blocks_gpu);
-    }
-    if (id == 7) {
-      SortChannelsSharedPreloadFloatCond<Out, In><<<collapsed_grid_dim, collapsed_block_dim, 0, stream>>>(simple_samples_gpu, collapsed_blocks_gpu);
-    }
-    if (id == 8) {
-      SortChannelsSharedPreloadFloatCondWrong<Out, In><<<collapsed_grid_dim, collapsed_block_dim, 0, stream>>>(simple_samples_gpu, collapsed_blocks_gpu);
-    }
-    if (id == 9) {
-      SortChannelsSharedPreloadFloatPrologueEpilogue<Out, In><<<collapsed_grid_dim, collapsed_block_dim, 0, stream>>>(simple_samples_gpu, collapsed_blocks_gpu);
-    }
     if (id == 10) {
-      SortChannelsSharedPreloadFloatPrologueEpilogueF32<Out, In><<<collapsed_grid_dim, collapsed_block_dim, 0, stream>>>(simple_samples_gpu, collapsed_blocks_gpu);
+      SortChannelsSharedPreloadFloatPrologueEpilogueF32<Out, In><<<offset_blk, 128, 0, stream>>>(simple_samples_gpu, first_blocks_gpu, nonempty_samples);
     }
     if (id == 11) {
-      SortChannelsSharedPreloadFloatPrologueEpilogueF32JustRead<Out, In><<<collapsed_grid_dim, collapsed_block_dim, 0, stream>>>(simple_samples_gpu, collapsed_blocks_gpu);
-    }
-    if (id == 12) {
-      SortChannelsSharedPreloadFloatPrologueEpilogueMirror<Out, In><<<collapsed_grid_dim, collapsed_block_dim, 0, stream>>>(simple_samples_gpu, collapsed_blocks_gpu);
-    }
-    if (id == 13) {
-      SortChannelsSharedPreloadFloatShortPrologueEpilogue<Out, In><<<collapsed_grid_dim, collapsed_block_dim, 0, stream>>>(simple_samples_gpu, collapsed_blocks_gpu);
-    }
-    if (id == 14) {
-      SortChannelsSharedPreloadFloatShortPrologueEpilogueF32<Out, In><<<collapsed_grid_dim, collapsed_block_dim, 0, stream>>>(simple_samples_gpu, collapsed_blocks_gpu);
-    }
-    if (id == 15) {
-      SortChannelsSharedPreloadFloatPrologueEpilogueF32Mirror<Out, In><<<collapsed_grid_dim, collapsed_block_dim, 0, stream>>>(simple_samples_gpu, collapsed_blocks_gpu);
-    }
-    if (id == 16) {
-      SortChannelsSharedPreloadFloatPrologueEpilogueF32_U2<Out, In><<<collapsed_grid_dim, collapsed_block_dim, 0, stream>>>(simple_samples_gpu, collapsed_blocks_gpu);
-    }
-    if (id == 17) {
-      SortChannelsSharedPreloadFloatPrologueEpilogueF32Crop<Out, In><<<collapsed_grid_dim, collapsed_block_dim, 0, stream>>>(simple_samples_gpu, collapsed_blocks_gpu);
+      SortChannelsSharedPreloadFloatPrologueEpilogueU8<Out, In><<<offset_blk, 128, 0, stream>>>(simple_samples_gpu, first_blocks_gpu, nonempty_samples);
     }
 
   }
@@ -1836,23 +1111,36 @@ void print_planes(T *data, int H, int W, int C) {
   }
 }
 
-void prep_gold(float *out, const uint8_t *in, int oH, int oW, int C, int iH, int iW,
+void prep_gold(float *out, const uint8_t *in, int oH, int oW, int oC, int iH, int iW, int iC, int transpose = false,
                int Y = 0, int X = 0) {
-  for (int c = 0; c < C; c++) {
-    for (int y = 0; y < oH; y++) {
-      for (int x = 0; x < oW; x++) {
-        out[c * oH * oW + y * oW + x] = in[(y + Y) * iW * C + (x + X) * C + c];
+  for (int y = 0; y < oH; y++) {
+    for (int x = 0; x < oW; x++) {
+
+      for (int c = 0; c < iC; c++) {
+        if (transpose) {
+          out[c * oH * oW + y * oW + x] = in[(y + Y) * iW * iC + (x + X) * iC + c];
+        } else {
+          out[y * oW * oC + x * oC + c] = in[(y + Y) * iW * iC + (x + X) * iC + c];
+        }
+      }
+
+      for (int c = iC; c < oC; c++) {;
+        if (transpose) {
+          out[c * oH * oW + y * oW + x] = 42.f + c;
+        } else {
+          out[y * oW * oC + x * oC + c] = 42.f + c;
+        }
       }
     }
   }
 }
 
-void prepare_and_run(int num_samples, int H, int W, int C) {
+void prepare_and_run(int num_samples, int H, int W, int C, int oC) {
   input_t *input_gpu;
   output_t *output_gpu;
   float *norm_add_gpu, *norm_mul_gpu;
   cudaMalloc((void **)&input_gpu, num_samples * sizeof(input_t) * H * W * C);
-  cudaMalloc((void **)&output_gpu, num_samples * sizeof(output_t) * H * W * C);
+  cudaMalloc((void **)&output_gpu, num_samples * sizeof(output_t) * H * W * oC);
   cudaMalloc((void **)&norm_add_gpu, num_samples * sizeof(float) * C);
   cudaMalloc((void **)&norm_mul_gpu, num_samples * sizeof(float) * C);
 
@@ -1870,8 +1158,7 @@ void prepare_and_run(int num_samples, int H, int W, int C) {
   }
 
   std::vector<output_t> gold_cpu;
-  gold_cpu.resize(H * W * C);
-  prep_gold(gold_cpu.data(), input_cpu.data(), H, W, C, H, W);
+  gold_cpu.resize(H * W * oC);
 
   cudaMemcpy(input_gpu, input_cpu.data(), sizeof(input_t) * H * W * C, cudaMemcpyHostToDevice);
   for (int i = 1; i < num_samples; i++) {
@@ -1880,26 +1167,28 @@ void prepare_and_run(int num_samples, int H, int W, int C) {
 
 
   std::vector<output_t> output_cpu;
-  output_cpu.resize(num_samples * H * W * C);
+  output_cpu.resize(num_samples * H * W * oC);
 
 
   cudaStream_t stream;
   cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking);
-  for (int id = 0; id < 18; id++) {
+  for (int id = 8; id < 12; id++) {
+
+    prep_gold(gold_cpu.data(), input_cpu.data(), H, W, oC, H, W, C, id < 9);
     if ((id == 6) && H * W * C % 4) {
       printf("Unaligned version, skipping 6\n");
       continue;
     }
     cudaMemset(output_gpu, 0, num_samples * sizeof(output_t) * H * W * C);
-    RunSN(num_samples, input_gpu, output_gpu, norm_add_gpu, norm_mul_gpu, stream, id, H, W, C);
+    RunSN(num_samples, input_gpu, output_gpu, norm_add_gpu, norm_mul_gpu, stream, id, H, W, C, oC);
 
-    cudaMemcpy(output_cpu.data(), output_gpu, sizeof(output_t) * num_samples *  H * W * C, cudaMemcpyDeviceToHost);
-    if (id == 8 || id == 12) {
-      printf("Skipping the check for 8, trailing data is wrong, 12 - mirror draft\n");
-      continue;
-    }
+    cudaMemcpy(output_cpu.data(), output_gpu, sizeof(output_t) * num_samples *  H * W * oC, cudaMemcpyDeviceToHost);
+    // if (id == 8 || id == 12) {
+    //   printf("Skipping the check for 8, trailing data is wrong, 12 - mirror draft\n");
+    //   continue;
+    // }
     for (int i = 0; i < num_samples; i++) {
-      auto res = compareData(gold_cpu.data(), output_cpu.data() + i * H * W * C, H * W * C, 0.01f, 0.0f);
+      auto res = compareData(gold_cpu.data(), output_cpu.data() + i * H * W * oC, H * W * oC, 0.01f, 0.0f);
       // printf("Expected: %d, sample %d\n", id, i);
       // print_planes(gold_cpu.data(), H, W, C);
       // printf("\n\n=============================================================\nComputed: %d, sample %d\n", id, i);
@@ -2091,7 +1380,7 @@ void prepare_and_run_crop(int num_samples, int H, int W, int C, int iH, int iW, 
 
   std::vector<output_t> gold_cpu;
   gold_cpu.resize(H * W * C);
-  prep_gold(gold_cpu.data(), input_cpu.data(), H, W, C, iH, iW, Y, X);
+  prep_gold(gold_cpu.data(), input_cpu.data(), H, W, C, iH, iW, C, true, Y, X);
 
   cudaMemcpy(input_gpu, input_cpu.data(), sizeof(input_t) * iH * iW * C, cudaMemcpyHostToDevice);
   for (int i = 1; i < num_samples; i++) {
